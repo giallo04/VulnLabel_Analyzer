@@ -77,30 +77,51 @@ class TestDiffScope(unittest.TestCase):
 
     def test_v2_record_uses_function_diff(self):
         rec = self._record("garbage", True, 1, 3)
-        rec["change"]["function_diff"] = "@@ -1,1 +1,1 @@\n-a\n+b"
-        rec["change"]["function_diff_truncated"] = False
+        rec["change"].update({"function_diff": "@@ -1,1 +1,1 @@\n-a\n+b",
+                              "function_diff_truncated": False, "deleted": 1, "inserted": 1})
         p = prompting.build_prompt(rec)
         self.assertIn("-a\n+b", p)
         self.assertNotIn("garbage", p)
 
-    def test_prompt_is_stateless_and_has_sweep_rules(self):
-        rec = self._record("", False, 1, 3)
-        self.assertEqual(prompting.build_prompt(rec), prompting.build_prompt(dict(rec)))
-        sysmsg = prompting.build_messages(rec)["system"]
-        for tag in ("<sweep_rules>", "<evidence_rules>"):
-            self.assertIn(tag, sysmsg)
-        self.assertIn("independent", sysmsg)
+    def test_v2_diff_with_more_deleted_lines_than_the_function_has_is_not_trusted(self):
+        """A line-anchored diff attributing 40 deleted lines to a 3-line function belongs to
+        other functions (huge rewritten block): it must not be shown to the model."""
+        rec = self._record("garbage", True, 1, 3)
+        rec["change"].update({"function_diff": "@@ -1,1 +1,1 @@\n-other function body\n+x",
+                              "function_diff_truncated": False, "deleted": 40, "inserted": 44})
+        self.assertFalse(prompting.diff_available(rec))
+        self.assertIn("NOT AVAILABLE", prompting.build_prompt(rec))
+        self.assertNotIn("other function body", prompting.build_prompt(rec))
 
-    def test_commit_profile_flags_wide_sweep(self):
+    def test_v3_diff_flag_and_consistency(self):
         rec = self._record("", False, 1, 3)
-        rec["commit"].update({"n_flagged_in_dataset": 190, "n_flagged_located": 187,
-                              "source_churn_in_flagged": 380, "source_churn_outside_flagged": 12})
-        text, sweep = prompting._commit_profile(rec)
-        self.assertTrue(sweep)
-        self.assertIn("WIDE SWEEP (many small uniform edits)   : yes", text)
-        rec["commit"].update({"n_flagged_in_dataset": 3, "n_flagged_located": 3,
-                              "source_churn_in_flagged": 300})
-        self.assertFalse(prompting._commit_profile(rec)[1])
+        rec["schema_version"] = 3
+        rec["change"].update({"function_diff": "@@ -1,1 +1,1 @@\n-a\n+b", "diff_method": "pair",
+                              "diff_reliable": True, "deleted": 1, "inserted": 1, "changed": 2})
+        self.assertTrue(prompting.diff_available(rec))
+        self.assertIn("compared with its post-fix version", prompting.build_prompt(rec))
+        rec["change"]["diff_reliable"] = False
+        self.assertFalse(prompting.diff_available(rec))
+        # counts say "changed" but the stored diff is empty -> inconsistent -> not usable
+        rec["change"].update({"diff_reliable": True, "function_diff": ""})
+        self.assertFalse(prompting.diff_available(rec))
+        # reformat only: usable and explicit
+        rec["change"].update({"whitespace_only": True, "changed": 0, "deleted": 0, "inserted": 0})
+        self.assertTrue(prompting.diff_available(rec))
+        self.assertIn("only whitespace or formatting differs", prompting.build_prompt(rec))
+
+    def test_prompt_is_stateless_and_carries_the_shared_commit_verdict(self):
+        rec = self._record("", False, 1, 3)
+        verdict = {"data": {"nature": "defect_fix", "root_cause": "rc", "fix_pattern": "fp",
+                            "fix_scope": "localized", "defect_class": "x", "evidence": "e"}}
+        self.assertEqual(prompting.build_prompt(rec, verdict), prompting.build_prompt(dict(rec), verdict))
+        msgs = prompting.build_messages(rec, verdict)
+        for tag in ("<evidence_rules>", "<categories>", "<method>"):
+            self.assertIn(tag, msgs["system"])
+        self.assertIn("independent", msgs["system"])
+        self.assertIn("Root cause   : rc", msgs["user"])
+        # the model is no longer asked to describe the commit again
+        self.assertNotIn("step_1_commit_nature", msgs["system"])
 
 
 class TestConfigAndIngestion(unittest.TestCase):
@@ -147,9 +168,12 @@ class TestPipelineDiffAndThinking(Base):
                               "hunks_truncated": True})
         bad["location"].update({"start_line": 1001, "end_line": 1004})
         bad["func"] = "x\n" * 4
+        bad["schema_version"] = 1                      # legacy enrichment: --refresh can fix it
+        for k in ("function_diff", "function_diff_truncated", "diff_method", "diff_reliable"):
+            bad["change"].pop(k)
         write_dataset(self.tmp / "enriched.jsonl", [bad, make_record(2)])
         self.run_main()
-        self.assertEqual(len(self.mock.requests), 1)
+        self.assertEqual(len(self.mock.func_requests), 1)
         self.assertEqual([r["hash"] for r in self.lines()], ["h0002"])
         self.assertIn("--refresh", self.log)
 

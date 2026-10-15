@@ -135,6 +135,36 @@ def _acc_stats(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _consistency(valid: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Coerenza tra le funzioni dello stesso commit (solo record LLM validi).
+
+    * ``mixed_commit_nature``: commit le cui funzioni hanno ricevuto descrizioni (natura) diverse:
+      con il verdetto condiviso deve essere 0;
+    * ``majority_share_*``: quota media di funzioni che concordano con la categoria / il target
+      più frequente del proprio commit. Non è un errore che sia < 1 (in un commit il fix può
+      stare in una funzione e le altre essere collaterali): serve a confrontare run diversi.
+    """
+    by_commit: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for r in valid:
+        if r.get("method") != STATIC_METHOD:
+            by_commit[str(r.get("commit_id") or "?")].append(r)
+    multi = {c: rs for c, rs in by_commit.items() if len(rs) >= 2}
+    if not multi:
+        return {"n_commits_multi": 0, "mixed_commit_nature": 0,
+                "majority_share_category": None, "majority_share_target": None}
+    mixed = 0
+    share_cat: List[float] = []
+    share_tgt: List[float] = []
+    for rs in multi.values():
+        natures = {r.get("commit_nature") for r in rs if r.get("commit_nature")}
+        mixed += len(natures) > 1
+        share_cat.append(Counter(r.get("category") for r in rs).most_common(1)[0][1] / len(rs))
+        share_tgt.append(Counter(r.get("predicted_target") for r in rs).most_common(1)[0][1] / len(rs))
+    return {"n_commits_multi": len(multi), "mixed_commit_nature": mixed,
+            "majority_share_category": sum(share_cat) / len(share_cat),
+            "majority_share_target": sum(share_tgt) / len(share_tgt)}
+
+
 def compute_summary(results: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     """Statistiche del dataset dai risultati del classificatore.
 
@@ -168,6 +198,9 @@ def compute_summary(results: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
 
     n_valid = len(valid)
     return {
+        "consistency": _consistency(valid),
+        "diff_methods": dict(Counter(str(r.get("diff_method")) for r in records
+                                     if r.get("method") != STATIC_METHOD and r.get("diff_method"))),
         "total_records": len(records),
         "parse_errors_excluded": len(parse_errors),
         "undeterminable_excluded": len(undeterminable),
@@ -211,6 +244,17 @@ def format_summary(summary: Dict[str, Any]) -> str:
     if c["n_commits"]:
         lines += ["", f"Rumore per commit: {_pct(c['mean_noise_rate'])} ± {_pct(c['std_noise_rate'])}"
                       f"  (n={c['n_commits']} commit)"]
+    cons = summary.get("consistency") or {}
+    if cons.get("n_commits_multi"):
+        lines += ["", "Coerenza tra funzioni dello stesso commit "
+                      f"({cons['n_commits_multi']} commit con >= 2 funzioni):",
+                  f"  commit con descrizione (natura) discordante : {cons['mixed_commit_nature']}",
+                  f"  accordo medio sulla categoria del commit    : {_pct(cons['majority_share_category'])}",
+                  f"  accordo medio sul target del commit         : {_pct(cons['majority_share_target'])}"]
+    dm = summary.get("diff_methods") or {}
+    if dm:
+        lines += ["", "Origine del diff (record LLM): "
+                  + ", ".join(f"{k}={v}" for k, v in sorted(dm.items(), key=lambda kv: -kv[1]))]
     lines.append("=" * 70)
     return "\n".join(lines)
 
@@ -236,11 +280,18 @@ _RESULT_COLUMNS = [
     "hash", "commit_id", "project", "func_name", "file",
     "original_target", "predicted_target", "is_noise",
     "category", "method", "model",
-    "step_1_commit_analysis", "step_2_function_diff_analysis", "step_3_conclusion",
+    "commit_nature", "commit_root_cause", "commit_fix_pattern", "commit_fix_scope",
+    "step_1_change", "step_2_flaw", "step_3_role",
+    "diff_method", "n_votes", "agreement",
     "rank_in_commit", "share_of_source_churn", "frac_changed",
     "kind", "siblings_count", "name_in_message", "cwe_matches_nvd", "cwe_missing",
     "parse_error", "parse_error_reason",
 ]
+
+
+_LEGACY_STEPS = {"step_1_change": "step_1_commit_analysis",
+                 "step_2_flaw": "step_2_function_diff_analysis",
+                 "step_3_role": "step_3_conclusion"}
 
 
 def save_results_csv(results: List[Dict[str, Any]], path: Path) -> None:
@@ -250,7 +301,11 @@ def save_results_csv(results: List[Dict[str, Any]], path: Path) -> None:
         w = csv.DictWriter(f, fieldnames=_RESULT_COLUMNS, extrasaction="ignore")
         w.writeheader()
         for r in results:
-            w.writerow({k: r.get(k, "") for k in _RESULT_COLUMNS})
+            row = {k: r.get(k, "") for k in _RESULT_COLUMNS}
+            for new, old in _LEGACY_STEPS.items():      # checkpoint scritti dalle versioni precedenti
+                if row[new] in ("", None):
+                    row[new] = r.get(old, "")
+            w.writerow(row)
 
 
 def save_results_jsonl(results: List[Dict[str, Any]], path: Path) -> None:

@@ -14,13 +14,16 @@ from dataclasses import asdict, dataclass, field
 
 from . import features as F
 from .dataset import Record
-from .diffparse import changed_in_range, parse_unified_diff, render_function_diff, shrink_lines
+from .diffparse import anchored_is_plausible, changed_in_range, map_line, parse_unified_diff, render_function_diff, shrink_lines
+from .funcspan import SourceFile, find_counterpart, pair_diff
 from .locate import FileView, Match, locate
 from .nvd import NvdClient
 from .repos import GitRepo, RepoProvider
 
 # v2: change.function_diff = diff ristretto alla funzione (v1 passava hunk interi, troncati da inizio)
-SCHEMA_VERSION = 2
+# v3: function_diff calcolato confrontando la funzione pre/post-fix (non con ancore di riga):
+#     aggiunge change.diff_method / diff_reliable / counterpart / whitespace_only
+SCHEMA_VERSION = 3
 
 
 @dataclass
@@ -44,6 +47,10 @@ class Located:
     deleted: list[str] = field(default_factory=list)
     inserted: list[str] = field(default_factory=list)
     hunks: list = field(default_factory=list)
+    pair: object = None              # funcspan.PairDiff (None = diff ancorato)
+    pair_method: str = "anchored"    # pair | pair_renamed | pair_moved | removed | added | anchored
+    counterpart: dict | None = None
+    reliable: bool = True
 
     @property
     def changed(self) -> int:
@@ -138,6 +145,24 @@ def _enrich_with_repo(repo: GitRepo, commit_id: str, requested: list[Record], al
             hunk_cache[p] = parse_unified_diff(repo.diff_file(base, commit_id, p))
         it.deleted, it.inserted, it.hunks = changed_in_range(hunk_cache[p], it.match.start, it.match.end, it.side)
 
+    # -- diff per funzione: confronto della coppia pre/post-fix (fallback: ancore di riga) -----
+    sides = _Sides(repo, base, commit_id, cand, old_views)
+    for it in items:
+        if it.match is None:
+            continue
+        length = it.match.end - it.match.start + 1
+        try:
+            pd, method, cp = _function_pair(it, sides, it.hunks)
+        except Exception:   # noqa: BLE001 - un'anomalia di parsing non deve fermare il commit
+            pd, method, cp = None, "pair_error", None
+        if pd is not None:
+            it.deleted, it.inserted = list(pd.deleted), list(pd.inserted)
+            it.pair, it.pair_method, it.counterpart, it.reliable = pd, method, cp, True
+        else:
+            # ancore di riga: credibili solo se le dimensioni sono compatibili con la funzione
+            it.pair, it.pair_method, it.counterpart = None, "anchored", None
+            it.reliable = anchored_is_plausible(len(it.deleted), len(it.inserted), length)
+
     located = [it for it in items if it.match is not None]
     in_flagged = sum(it.changed for it in located)
     commit["source_churn_in_flagged"] = in_flagged
@@ -164,16 +189,25 @@ def _enrich_with_repo(repo: GitRepo, commit_id: str, requested: list[Record], al
             b["location"] = {"file": m.path, "start_line": m.start, "end_line": m.end, "side": it.side,
                              "method": m.method, "n_matches": m.n_matches, "score": round(m.score, 4)}
             text, trunc = _render_hunks(it.hunks, cfg.max_hunk_chars)
-            fdiff = render_function_diff(it.hunks, m.start, m.end, it.side)
+            if it.pair is not None:
+                fdiff, kind = it.pair.text, _kind_of(it.pair)
+                ws_only = it.pair.whitespace_only
+            elif it.reliable:
+                fdiff = render_function_diff(it.hunks, m.start, m.end, it.side)
+                kind, ws_only = F.classify_change(it.deleted, it.inserted), False
+            else:       # attribuzione non credibile: meglio nessun diff che il diff di un'altra funzione
+                fdiff, kind, ws_only = "", F.classify_change(it.deleted, it.inserted), False
             fdiff, fdiff_trunc, _ = shrink_lines(fdiff, cfg.max_function_diff_chars)
             length = m.end - m.start + 1
             b["change"] = {
                 "deleted": len(it.deleted), "inserted": len(it.inserted), "changed": it.changed,
                 "frac_changed": round(it.changed / length, 4),
                 "share_of_source_churn": round(it.changed / src_churn, 4) if src_churn else None,
-                "kind": F.classify_change(it.deleted, it.inserted),
+                "kind": kind,
                 "rank_in_commit": rank[r.hash], "hunks": text, "hunks_truncated": trunc,
                 "function_diff": fdiff, "function_diff_truncated": fdiff_trunc,
+                "diff_method": it.pair_method, "diff_reliable": it.reliable,
+                "whitespace_only": ws_only, "counterpart": it.counterpart,
                 "file_is_test": F.is_test_path(m.path),
             }
         b["siblings"] = [s for s in sib_summary if s["hash"] != r.hash]
@@ -184,6 +218,90 @@ def _enrich_with_repo(repo: GitRepo, commit_id: str, requested: list[Record], al
         })
         out.append(b)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Diff a livello di funzione (confronto della coppia pre/post-fix)
+# ---------------------------------------------------------------------------
+def _kind_of(pd) -> str:
+    """'none' | 'whitespace' | 'comment_or_blank' | 'code' dal diff della coppia di funzioni."""
+    if pd.identical:
+        return "none"
+    if pd.whitespace_only:
+        return "whitespace"
+
+    def cosmetic(l: str) -> bool:
+        t = l.strip()
+        return not t or t.startswith(("//", "/*", "*", "*/"))
+
+    if all(cosmetic(l) for l in pd.deleted + pd.inserted):
+        return "comment_or_blank"
+    return "code"
+
+
+class _Sides:
+    """File dei due lati del commit, con cache e lettura pigra del lato post-fix."""
+
+    def __init__(self, repo: GitRepo, base: str, commit_id: str, cand: list[str],
+                 old_views: list[FileView]) -> None:
+        self.repo, self.commit_id, self.cand = repo, commit_id, cand
+        self.old = {v.path: SourceFile(v.path, v.text) for v in old_views}
+        self._new: dict[str, SourceFile | None] = {}
+        self._all_new = False
+
+    def new(self, path: str) -> SourceFile | None:
+        if path not in self._new:
+            text = self.repo.read_blobs(self.commit_id, [path]).get(path)
+            self._new[path] = SourceFile(path, text) if text is not None else None
+        return self._new[path]
+
+    def all_new(self) -> list[SourceFile]:
+        if not self._all_new:
+            missing = [p for p in self.cand if p not in self._new]
+            blobs = self.repo.read_blobs(self.commit_id, missing) if missing else {}
+            for p in missing:
+                self._new[p] = SourceFile(p, blobs[p]) if blobs.get(p) is not None else None
+            self._all_new = True
+        return [f for f in self._new.values() if f is not None]
+
+    def all_old(self) -> list[SourceFile]:
+        return list(self.old.values())
+
+
+def _function_pair(it: Located, sides: _Sides, hunks: list):
+    """Diff della funzione = confronto con la sua controparte sull'altro lato del commit.
+
+    Ritorna (PairDiff | None, method, counterpart dict | None). None = controparte non
+    trovata: il chiamante ripiega sul diff ancorato (se credibile).
+    """
+    m = it.match
+    mine_old = it.side == "old"
+    mine = sides.old.get(m.path) if mine_old else sides.new(m.path)
+    if mine is None:
+        return None, "unlocated", None
+    my_lines = mine.lines[m.start - 1:m.end]
+    other_same = sides.new(m.path) if mine_old else sides.old.get(m.path)
+    expected = map_line(hunks, m.start, "old" if mine_old else "new")
+    lazy_other = sides.all_new if mine_old else sides.all_old
+    cp = find_counterpart(it.name, my_lines, other_same, lazy_other, expected)
+    if cp is None:
+        if other_same is None:      # il file non esiste dall'altro lato: funzione tolta/aggiunta
+            other_lines, o_start = [], 1
+            method = "removed" if mine_old else "added"
+            return (pair_diff(my_lines, other_lines, m.start, o_start) if mine_old
+                    else pair_diff(other_lines, my_lines, o_start, m.start)), method, None
+        return None, "no_counterpart", None
+    other_src = (sides.new(cp.path) if mine_old else sides.old.get(cp.path))
+    if other_src is None:
+        return None, "no_counterpart", None
+    other_lines = other_src.lines[cp.start - 1:cp.end]
+    if mine_old:
+        pd = pair_diff(my_lines, other_lines, m.start, cp.start)
+    else:
+        pd = pair_diff(other_lines, my_lines, cp.start, m.start)
+    method = {"same_name": "pair", "renamed": "pair_renamed", "other_file": "pair_moved"}[cp.how]
+    return pd, method, {"path": cp.path, "start_line": cp.start, "end_line": cp.end,
+                        "name": cp.name, "score": round(cp.score, 4), "how": cp.how}
 
 
 def _sibling(it: Located) -> dict:

@@ -49,8 +49,12 @@ def make_record(i: int, *, test_file: bool = False) -> dict:
         "cwe": ["CWE-125"],
         "commit": {"message": "fix oob read", "cves": ["CVE-1"], "n_flagged_in_dataset": 3,
                    "source_churn": 10, "n_files": 1},
+        "schema_version": 3,
         "change": {"kind": "code", "rank_in_commit": 1, "share_of_source_churn": 0.5,
-                   "frac_changed": 0.2, "deleted": 1, "inserted": 1,
+                   "frac_changed": 0.2, "deleted": 1, "inserted": 1, "changed": 2,
+                   "function_diff": "@@ -1,3 +1,3 @@\n int f(int a) {\n-  return a;\n+  return a + 1;\n }",
+                   "function_diff_truncated": False, "diff_method": "pair",
+                   "diff_reliable": True, "whitespace_only": False,
                    "file_is_test": test_file},
         "location": {"file": "tests/foo_test.c" if test_file else "src/foo.c",
                      "start_line": 1, "end_line": 3, "side": "old"},
@@ -67,9 +71,21 @@ def write_dataset(path: Path, records: list[dict]) -> None:
 
 def llm_json(category: str = "CORRECT_LABEL") -> str:
     return json.dumps({
-        "step_1_commit_analysis": "a", "step_2_function_diff_analysis": "b",
-        "step_3_conclusion": "c", "category": category,
+        "step_1_change": "a", "step_2_flaw": "b", "step_3_role": "c", "category": category,
     })
+
+
+def commit_json(nature: str = "defect_fix", root_cause: str = "oob read in parser") -> str:
+    return json.dumps({
+        "evidence": "message says fix oob read", "root_cause": root_cause,
+        "defect_class": "out-of-bounds read", "fix_pattern": "adds a bounds check",
+        "fix_scope": "localized", "nature": nature,
+    })
+
+
+def is_commit_request(body: dict) -> bool:
+    """Commit-level verdict calls carry the commit system prompt."""
+    return "characterising ONE commit" in json.dumps(body.get("systemInstruction") or {})
 
 
 def daily_429():
@@ -99,6 +115,9 @@ class GeminiMock:
         self.always: tuple[int, dict] | None = None
         self.block_hash: str | None = None
         self.category = "WRONG_LABEL_IRRELEVANT"
+        self.commit_nature = "defect_fix"
+        self.answer = None      # optional callable(body, prompt) -> answer text for function calls
+        self.commit_answer = None   # same, for the commit-level verdict calls
         self.lock = threading.Lock()
         self.n_ok = 0
         mock = self
@@ -130,17 +149,32 @@ class GeminiMock:
                         return self._send(code, obj)
                     if mock.ok_budget is not None and mock.n_ok >= mock.ok_budget:
                         return self._send(429, daily_429())
-                    mock.n_ok += 1
+                    if not is_commit_request(body):      # the budget counts function answers
+                        mock.n_ok += 1
                 prompt = body["contents"][0]["parts"][0]["text"]
                 if mock.block_hash and mock.block_hash in prompt:
                     return self._send(200, {"promptFeedback": {"blockReason": "PROHIBITED_CONTENT"}})
-                parts = [{"text": "internal thoughts", "thought": True},
-                         {"text": llm_json(mock.category)}]
+                if is_commit_request(body):
+                    text = (mock.commit_answer(body, prompt) if mock.commit_answer
+                            else commit_json(mock.commit_nature))
+                elif mock.answer:
+                    text = mock.answer(body, prompt)
+                else:
+                    text = llm_json(mock.category)
+                parts = [{"text": "internal thoughts", "thought": True}, {"text": text}]
                 self._send(200, {"candidates": [{"content": {"parts": parts}, "finishReason": "STOP"}]})
 
         self.srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
         self.url = f"http://127.0.0.1:{self.srv.server_address[1]}"
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    @property
+    def func_requests(self) -> list[dict]:
+        return [r for r in self.requests if not is_commit_request(r)]
+
+    @property
+    def commit_requests(self) -> list[dict]:
+        return [r for r in self.requests if is_commit_request(r)]
 
     def close(self):
         self.srv.shutdown()
@@ -213,7 +247,7 @@ class TestPipeline(Base):
         self.assertTrue(all(r["category"] == "WRONG_LABEL_IRRELEVANT" for r in llm_rows))
         self.assertEqual({r["model"] for r in llm_rows}, {"gemini-3.8-flash"})
         # the test-file record is classified deterministically, without an API call
-        self.assertEqual(len(self.mock.requests), 6)
+        self.assertEqual(len(self.mock.func_requests), 6)
         for name in ("results.csv", "results_full.jsonl", "accuracy_summary.json", "stats_report.txt"):
             self.assertTrue((self.out_dir / name).exists(), name)
         summary = json.loads((self.out_dir / "accuracy_summary.json").read_text())
@@ -223,13 +257,18 @@ class TestPipeline(Base):
     def test_request_shape(self):
         write_dataset(self.tmp / "enriched.jsonl", [make_record(1)])
         self.run_main("--thinking", "low")
-        req = self.mock.requests[0]
+        req = self.mock.func_requests[0]
         self.assertEqual(self.mock.keys[0], "test-key")
         self.assertEqual(self.mock.paths[0], "/v1beta/models/gemini-3.8-flash:generateContent")
         gc = req["generationConfig"]
         self.assertEqual(gc["responseMimeType"], "application/json")
         self.assertEqual(gc["thinkingConfig"], {"thinkingLevel": "low"})
         self.assertEqual(gc["seed"], 42)
+        self.assertEqual(gc["temperature"], 0.2)
+        # structured output + static rules in systemInstruction, record data in the user turn
+        self.assertEqual(gc["responseSchema"]["required"][-1], "category")
+        self.assertIn("<categories>", req["systemInstruction"]["parts"][0]["text"])
+        self.assertNotIn("<categories>", req["contents"][0]["parts"][0]["text"])
         # thought parts must not leak into the parsed answer
         res = self.lines()[0]
         self.assertFalse(res["parse_error"])
@@ -241,7 +280,7 @@ class TestPipeline(Base):
         self.assertEqual(len(self.lines()), 4)
         self.mock.requests.clear()
         self.run_main()
-        self.assertEqual(len(self.mock.requests), 6)
+        self.assertEqual(len(self.mock.func_requests), 6)
         self.assertEqual(len(self.lines()), 10)          # no duplicates
         self.mock.requests.clear()
         self.run_main()                                  # nothing left to do
@@ -252,14 +291,14 @@ class TestPipeline(Base):
         self.run_main()
         self.mock.requests.clear()
         self.run_main("--no-resume")
-        self.assertEqual(len(self.mock.requests), 3)
+        self.assertEqual(len(self.mock.func_requests), 3)
 
     def test_warns_when_checkpoint_has_another_model(self):
         write_dataset(self.tmp / "enriched.jsonl", [make_record(i) for i in range(4)])
         self.run_main("--limit", "2", "--model", "model-a")
         self.run_main("--model", "model-b")
         self.assertIn("other model", self.log)
-        self.assertEqual(len(self.mock.requests), 2 + 2)   # b only did the 2 missing records
+        self.assertEqual(len(self.mock.func_requests), 2 + 2)   # b only did the 2 missing records
 
     def test_missing_key_fails_fast(self):
         write_dataset(self.tmp / "enriched.jsonl", [make_record(1)])
@@ -300,7 +339,7 @@ class TestApiFailureModes(Base):
         self.mock.ok_budget = None
         self.mock.requests.clear()
         self.run_main("--workers", "1")
-        self.assertEqual(len(self.mock.requests), 5)
+        self.assertEqual(len(self.mock.func_requests), 5)
         self.assertEqual(len(self.lines()), 8)
 
     def test_per_minute_429_waits_then_succeeds(self):

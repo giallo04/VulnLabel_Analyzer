@@ -11,7 +11,15 @@ written by older versions keep working.
 
 What is NOT written to the checkpoint (so it is retried on the next run):
 daily quota exhausted, invalid key, API unreachable/overloaded after the retries.
-Blocked or unparsable answers are recorded as ``UNDETERMINABLE`` with ``parse_error=true``.
+Blocked or unparsable answers are recorded as ``UNDETERMINABLE`` with ``parse_error=true``
+(``retry_errors=True`` re-queries them on resume).
+
+Consistency
+-----------
+Each commit is characterised ONCE (``core/commit_verdict.py``) and the verdict is injected
+unchanged into the prompt of every function of that commit. Optional self-consistency
+(``votes`` > 1): majority vote over several sampled answers; a tie is recorded as
+``UNDETERMINABLE`` (precision over coverage) with ``vote_tie=true``.
 """
 from __future__ import annotations
 
@@ -24,12 +32,17 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .checkpoint import CheckpointWriter, load_checkpoint_deduped
-from .deterministic import deterministic_classify
-from .llm_engine import LLMAbort, LLMConfig, LLMTransientError, query_llm
+from .commit_verdict import CommitVerdicts
+from .deterministic import deterministic_classify, undeterminable_no_diff
+from .llm_engine import LLMAbort, LLMConfig, LLMTransientError, query_llm_ex
 from .parser import parse_llm_response
-from .prompting import PROMPT_VERSION, build_prompt, diff_available, prompt_meta
+from .prompting import (GEMINI_RESPONSE_SCHEMA, PROMPT_VERSION, aggregate_votes, build_messages,
+                        commit_key, diff_available, prompt_meta)
 
 MAX_CONSECUTIVE_TRANSIENT = 8   # stop after this many back-to-back transient failures
+MAX_PARSE_ATTEMPTS = 3          # new samples for the same prompt when the answer is not parsable
+VOTE_MIN_TEMPERATURE = 0.7      # with votes > 1 the samples must differ, otherwise voting is moot
+ENRICH_SCHEMA_WITH_PAIR_DIFF = 3   # first enricher schema with reliable function-level diffs
 
 
 # ---------------------------------------------------------------------------
@@ -50,12 +63,63 @@ class RunOutcome:
 # ---------------------------------------------------------------------------
 # Record processing
 # ---------------------------------------------------------------------------
-def process_record(record: Dict[str, Any], cfg: LLMConfig) -> Dict[str, Any]:
-    """Full LLM cycle for a single record. Returns a result dict."""
-    prompt = build_prompt(record)          # stateless: a pure function of this record
-    meta = prompt_meta(record)
-    raw_response = query_llm(prompt, cfg)
-    parsed = parse_llm_response(raw_response)
+def _ask_once(msgs: Dict[str, str], cfg: LLMConfig, *, seed: int, temperature: float
+              ) -> Dict[str, Any]:
+    """One answer for the prompt; up to MAX_PARSE_ATTEMPTS tries if the output is not parsable
+    (a cut-off answer, MAX_TOKENS, is retried with a doubled output budget)."""
+    budget = cfg.max_output_tokens
+    parsed: Dict[str, Any] = {}
+    attempts = 0
+    for k in range(MAX_PARSE_ATTEMPTS):
+        reply = query_llm_ex(msgs["user"], cfg, system=msgs["system"],
+                             schema=GEMINI_RESPONSE_SCHEMA, temperature=temperature,
+                             seed=seed + k, max_output_tokens=budget)
+        attempts += 1
+        parsed = parse_llm_response(reply.text)
+        if not parsed["parse_error"]:
+            break
+        if reply.truncated:
+            budget = min(budget * 2, 65536)
+    parsed["attempts"] = attempts
+    return parsed
+
+
+def _combine(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Majority vote over the samples (parse failures ignored). One sample = that sample."""
+    valid = [p for p in samples if not p["parse_error"]]
+    if not valid:
+        return {**samples[0], "n_votes": len(samples), "agreement": 0.0, "vote_counts": {},
+                "vote_tie": False}
+    if len(samples) == 1:
+        return {**valid[0], "n_votes": 1, "agreement": 1.0,
+                "vote_counts": {valid[0]["category"]: 1}, "vote_tie": False}
+    agg = aggregate_votes(valid)
+    if agg["tie"]:
+        rep = dict(valid[0])
+        rep.update(category="UNDETERMINABLE", predicted_target=-1)
+        return {**rep, "n_votes": len(samples), "agreement": agg["agreement"],
+                "vote_counts": agg["counts"], "vote_tie": True}
+    rep = next(p for p in valid if p["category"] == agg["category"])
+    return {**rep, "n_votes": len(samples), "agreement": agg["agreement"],
+            "vote_counts": agg["counts"], "vote_tie": False}
+
+
+def process_record(record: Dict[str, Any], cfg: LLMConfig, *,
+                   verdicts: Optional[CommitVerdicts] = None,
+                   ctx: Optional[Dict[str, Any]] = None, votes: int = 1) -> Dict[str, Any]:
+    """Full LLM cycle for a single record. Returns a result dict.
+
+    The commit verdict (when `verdicts` is given) is shared by all the functions of the commit.
+    """
+    verdict = verdicts.get(record, ctx) if verdicts is not None else None
+    msgs = build_messages(record, verdict)          # stateless: pure function of record + verdict
+    meta = prompt_meta(record, verdict)
+
+    votes = max(1, int(votes))
+    temperature = cfg.temperature if votes == 1 else max(cfg.temperature, VOTE_MIN_TEMPERATURE)
+    samples = [_ask_once(msgs, cfg, seed=cfg.seed + 101 * i, temperature=temperature)
+               for i in range(votes)]
+    parsed = _combine(samples)
 
     original_target = int(record.get("target", -1))
     predicted_target = parsed["predicted_target"]
@@ -79,14 +143,26 @@ def process_record(record: Dict[str, Any], cfg: LLMConfig) -> Dict[str, Any]:
         "thinking_level": cfg.thinking_level,
         "prompt_version": meta["prompt_version"],
         "diff_truncated": meta["diff_truncated"],
-        "wide_sweep": meta["wide_sweep"],
+        "diff_method": meta["diff_method"],
+        # commit description: identical for every function of the commit
+        "commit_nature": meta["commit_nature"],
+        "commit_root_cause": meta["commit_root_cause"],
+        "commit_fix_pattern": meta["commit_fix_pattern"],
+        "commit_fix_scope": meta["commit_fix_scope"],
+        "commit_verdict_fallback": bool((verdict or {}).get("fallback", False)),
         # full reasoning
-        "step_1_commit_analysis":        parsed["step_1_commit_analysis"],
-        "step_2_function_diff_analysis": parsed["step_2_function_diff_analysis"],
-        "step_3_conclusion":             parsed["step_3_conclusion"],
+        "step_1_change": parsed.get("step_1_change", ""),
+        "step_2_flaw":   parsed.get("step_2_flaw", ""),
+        "step_3_role":   parsed.get("step_3_role", ""),
         "raw_output":         parsed.get("raw_output"),
         "parse_error":        parsed["parse_error"],
         "parse_error_reason": parsed.get("parse_error_reason", ""),
+        "attempts":           parsed.get("attempts", 1),
+        # self-consistency
+        "n_votes":     parsed["n_votes"],
+        "agreement":   parsed["agreement"],
+        "vote_counts": parsed["vote_counts"],
+        "vote_tie":    parsed["vote_tie"],
         # enricher signals (downstream analysis)
         "rank_in_commit":        change.get("rank_in_commit"),
         "share_of_source_churn": change.get("share_of_source_churn"),
@@ -147,6 +223,9 @@ def run_pipeline(
     resume: bool = True,
     skip_deterministic: bool = False,
     stop: Optional[threading.Event] = None,
+    votes: int = 1,
+    use_commit_verdict: bool = True,
+    retry_errors: bool = False,
 ) -> RunOutcome:
     """Classify `records` with `cfg`, appending every result to `checkpoint`."""
     out = RunOutcome(n_selected=len(records))
@@ -156,8 +235,10 @@ def run_pipeline(
     already_done: set[str] = set()
     if resume and checkpoint.exists():
         previous = load_checkpoint_deduped(checkpoint)
-        already_done = {str(r["hash"]) for r in previous}
-        _log(f"  → resuming: {len(already_done)} hashes already in {checkpoint}")
+        retry = [r for r in previous if retry_errors and r.get("parse_error")]
+        already_done = {str(r["hash"]) for r in previous} - {str(r["hash"]) for r in retry}
+        _log(f"  → resuming: {len(already_done)} hashes already in {checkpoint}"
+             + (f" ({len(retry)} parse-error records will be retried)" if retry else ""))
         other = {r.get("model") for r in previous
                  if r.get("method") == "llm" and r.get("model") not in (None, cfg.model_name)}
         if other:
@@ -189,16 +270,41 @@ def run_pipeline(
         _log(f"  → deterministic pre-filter: {len(determ_results)} classified, "
              f"{len(to_llm)} sent to the API")
 
-    # records whose function diff was lost (v1 enrichment truncated it): asking the model
-    # would only produce a guess -> not sent, not checkpointed, reported
-    no_diff = [r for r in to_llm if not diff_available(r)]
-    if no_diff:
-        skip = {id(r) for r in no_diff}
+    # records without a usable function diff: asking the model would only produce a guess
+    unusable = [r for r in to_llm if not diff_available(r)]
+    if unusable:
+        skip = {id(r) for r in unusable}
         to_llm = [r for r in to_llm if id(r) not in skip]
-        out.n_no_diff = len(no_diff)
-        _log(f"  ⚠ {len(no_diff)} records skipped: their diff was truncated before reaching the "
-             f"function (enriched with an old schema). Re-run "
-             f"`python -m dv_enricher ... --refresh`, then run again.")
+        # schema >= 3: the enricher already did its best (function-pair comparison) -> final
+        # UNDETERMINABLE, checkpointed; older schemas: --refresh can still recover the diff
+        final = [r for r in unusable
+                 if int(r.get("schema_version") or 1) >= ENRICH_SCHEMA_WITH_PAIR_DIFF]
+        final_ids = {id(r) for r in final}
+        legacy = [r for r in unusable if id(r) not in final_ids]
+        for r in final:
+            determ_results.append(undeterminable_no_diff(r))
+        if final:
+            _log(f"  → {len(final)} records recorded as UNDETERMINABLE: no diff could be "
+                 f"attributed to the function (function pair not found, ambiguous or "
+                 f"inconsistent); no API call")
+        if legacy:
+            out.n_no_diff = len(legacy)
+            _log(f"  ⚠ {len(legacy)} records skipped: their diff was truncated or not reliably "
+                 f"attributed to the function (enriched with an old schema). Re-run "
+                 f"`python -m dv_enricher ... --refresh`, then run again.")
+
+    # commit context + shared commit verdicts (one API call per commit)
+    ctx_by_commit: Dict[str, Dict[str, Any]] = {}
+    for r in records:
+        c = ctx_by_commit.setdefault(commit_key(r), {"cwes": set(), "n_selected": 0})
+        c["cwes"].update(r.get("cwe") or [])
+        c["n_selected"] += 1
+    for c in ctx_by_commit.values():
+        c["cwes"] = sorted(c["cwes"])
+    verdicts = (CommitVerdicts(cfg, checkpoint.parent / "commit_verdicts.jsonl")
+                if use_commit_verdict else None)
+    if verdicts is not None and verdicts.n_loaded:
+        _log(f"  → {verdicts.n_loaded} commit verdicts reused from commit_verdicts.jsonl")
 
     written = 0
     if todo:
@@ -211,7 +317,8 @@ def run_pipeline(
             if stop.is_set():
                 return "skipped", r, None
             try:
-                return "ok", r, process_record(r, cfg)
+                return "ok", r, process_record(
+                    r, cfg, verdicts=verdicts, ctx=ctx_by_commit.get(commit_key(r)), votes=votes)
             except LLMAbort as exc:
                 stop.set()
                 return "abort", r, exc
@@ -267,6 +374,9 @@ def run_pipeline(
     else:
         out.status = "nothing_to_do"
 
+    if verdicts is not None and verdicts.n_api_calls:
+        _log(f"  → commit verdicts: {verdicts.n_api_calls} API calls for "
+             f"{len(ctx_by_commit)} commits")
     out.n_new = written
     out.results = load_checkpoint_deduped(checkpoint) if checkpoint.exists() else []
     done_now = {str(r.get("hash")) for r in out.results}

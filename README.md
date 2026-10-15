@@ -37,13 +37,13 @@ python -m dv_enricher --dataset diversevul_20230702.zip --out enriched.jsonl --w
 
 Riprendibile: i record già in `enriched.jsonl` e i repository già clonati vengono riusati. Opzioni utili: `--project`, `--sample N`, `--hashes-file`, `--nvd`, `--repo-map`.
 
-**Schema v2 e `--refresh`.** Ogni record ha ora `change.function_diff`: il diff ristretto alle sole righe della funzione (più 3 righe di contesto), con le `+` abbinate alle `-` che sostituiscono anche dentro blocchi di modifica enormi. Le versioni precedenti passavano al modello gli *hunk interi* del file, troncati ai primi N caratteri: in una riscrittura estesa (es. libreria aggiornata) un solo hunk copre decine di funzioni e le righe della funzione esaminata sparivano, quindi il modello vedeva solo altre funzioni e dichiarava la funzione «non modificata». Per correggere un `enriched.jsonl` vecchio:
+**Schema v3: diff per funzione e `--refresh`.** Ogni record ha `change.function_diff`: il diff della sola funzione, ottenuto **confrontando la funzione prima e dopo il commit** (`dv_enricher/funcspan.py`): la stessa funzione viene ritrovata sul lato post-fix (per nome; a parità di nome vince la più simile e la più vicina alla posizione attesa; sono gestiti funzioni rinominate nello stesso file e file spostati/rinominati) e i due testi vengono confrontati. Il diff contiene così per costruzione solo righe di quella funzione, con numeri di riga reali. Le versioni precedenti attribuivano le righe `+` con ancore di riga: in un file riscritto/riformattato/riordinato (es. libreria aggiornata, caso cJSON) al modello arrivava il corpo di *altre* funzioni (`frac_changed` > 1, «il diff mostra cJSON_Minify»). Campi nuovi: `diff_method` (`pair`, `pair_renamed`, `pair_moved`, `removed`, `added`, `anchored`), `diff_reliable`, `whitespace_only`, `counterpart`. Se la controparte non esiste si ripiega sulle ancore di riga, **accettate solo se plausibili** (non si attribuiscono più righe cancellate di quante la funzione ne abbia); altrimenti il diff è marcato non affidabile e il modello non lo vede. La differenza di soli spazi/indentazione (anche righe spezzate o unite; gli spazi dentro le stringhe contano) è dichiarata esplicitamente e non è mai scambiata per una modifica. Per rielaborare un `enriched.jsonl` vecchio:
 
 ```bash
 python -m dv_enricher --dataset diversevul_20230702.zip --out enriched.jsonl --workdir work --refresh
 ```
 
-`--refresh` rielabora solo i record con `schema_version` < 2 e **aggiunge** le nuove righe in coda; in lettura, per ogni hash vince l'ultima riga. Se non lo fai, `main.py` classifica comunque i record vecchi i cui hunk sono completi (il diff viene ritagliato al volo), e **salta senza chiamare l'API e senza scrivere nel checkpoint** quelli il cui diff era già stato troncato prima di arrivare alla funzione (lo segnala nel log). Limiti di caratteri: `--max-hunk-chars` (hunk interi, usati dal pre-filtro) e `--max-function-diff-chars` (diff per il modello; se supera il limite si tengono testa e coda). Timeout per comando git: variabile `DV_GIT_TIMEOUT` (default 900 s).
+`--refresh` rielabora i record con `schema_version` < 3 e **aggiunge** le nuove righe in coda; in lettura, per ogni hash vince l'ultima riga. Senza refresh, `main.py` **salta senza chiamare l'API e senza scrivere nel checkpoint** i record vecchi il cui diff è troncato o non attendibile (lo segnala nel log). I record di schema ≥ 3 senza diff attribuibile sono invece registrati come `UNDETERMINABLE` (regola `diff_unrecoverable`, nessuna chiamata API, esclusi dal denominatore). Limiti di caratteri: `--max-hunk-chars` e `--max-function-diff-chars` (testa e coda se supera il limite). Timeout git: `DV_GIT_TIMEOUT` (default 900 s).
 
 ### 2. Classificazione
 
@@ -53,7 +53,9 @@ python main.py --dataset enriched.jsonl --model gemini-3.8-flash --workers 4 --r
 
 Il **thinking è `high` di default** (`--thinking minimal|low|medium|high|default`). `default` non invia `thinkingConfig`: serve per modelli senza livelli di thinking (es. Gemma); se il modello rifiuta il thinking l'errore è fatale e chiaro, non una riga rovinata per ogni record. Il thinking consuma token di output, per questo `--max-output-tokens` è salito a 32768. Per il free tier (≈500 richieste/giorno) usa un modello Flash-Lite, ad es. `--model gemini-3.5-flash-lite --rpm 15`; verifica i limiti nella pagina Rate limit di AI Studio.
 
-**Prompt e chiamate stateless.** Ogni richiesta è indipendente: il prompt è una funzione pura del singolo record, senza memoria delle altre funzioni. La coerenza nei commit «a tappeto» (stessa modifica meccanica in decine di funzioni: pulizia di warning, hardening di conversioni, migrazione di API) si ottiene con un rubric fisso per istanza (`<sweep_rules>`) e con numeri di commit calcolati dal record stesso (`<commit_profile>`: funzioni segnalate, righe medie modificate, `WIDE SWEEP` sì/no), non con la memoria tra chiamate. Il rubric chiede di nominare il pattern, decidere se il commit è un vero fix o una pulizia, e applicare lo stesso test a ogni sito: valore proveniente da input esterno che viene troncato/avvolto/rilasciato due volte e che la modifica chiude → `CORRECT_LABEL`; operando provatamente innocuo o modifica che silenzia solo un warning (cast esplicito, suffisso `U`, tipo di parametro) → `WRONG_LABEL_CONSISTENCY`. Le `<evidence_rules>` vietano di attribuire alla funzione modifiche di altre funzioni, impongono `UNDETERMINABLE` se il diff manca e vietano le auto-correzioni nei campi di ragionamento. Ogni risultato salva `prompt_version`, `thinking_level`, `diff_truncated`, `wide_sweep`. Se il checkpoint contiene risultati di un'altra versione del prompt, `main.py` lo segnala: per riclassificare usa un `--out-dir` nuovo (o `--no-resume`).
+**Coerenza tra le funzioni dello stesso commit.** Il commit viene caratterizzato **una sola volta** (`core/commit_verdict.py`: natura, causa radice, schema della correzione, ambito `localized|distributed|sweep`; una chiamata per commit a temperatura 0, thread-safe) e il verdetto è inserito **identico** nel prompt di ogni sua funzione (`<commit_verdict>`); il modello non ridescrive più il commit, giudica solo la funzione rispetto a esso. Il verdetto è salvato in `<out-dir>/commit_verdicts.jsonl`, quindi dopo un resume il commit resta descritto come prima. Il verdetto vede messaggio, CVE, CWE (unione su tutte le funzioni del commit), dimensione e file principali. Ogni risultato salva `commit_nature`, `commit_root_cause`, `commit_fix_pattern`, `commit_fix_scope`; `stats.py summary` riporta quanti commit hanno descrizioni discordanti (deve essere 0). Le chiamate restano stateless: il prompt è funzione pura di record + verdetto.
+
+**Accuratezza e precisione.** Temperatura default `0.2` (come documentato), seed fisso, regole statiche in `systemInstruction`, **output strutturato** (`responseSchema`: JSON sempre valido e `category` dentro l'enum; `--no-schema` per modelli che non lo supportano). Un output non parsabile è ritentato fino a 3 volte (se troncato da `MAX_TOKENS`, con budget raddoppiato) e, se ancora fallisce, è un `parse_error` — mai un verdetto (`--retry-errors` lo rimette in coda al resume). Con `--votes 3` si vota a maggioranza su 3 campioni (temperatura ≥ 0.7, seed diversi); un pareggio è `UNDETERMINABLE` con `vote_tie=true`, e `agreement` è un indice di confidenza. Ogni risultato salva `prompt_version`, `thinking_level`, `diff_method`, `diff_truncated`, `attempts`, `n_votes`, `agreement`. Se il checkpoint contiene risultati di un'altra versione del prompt, `main.py` lo segnala: per riclassificare usa un `--out-dir` nuovo (o `--no-resume`).
 
 - Il **checkpoint** (`<out-dir>/checkpoint.jsonl`, una riga JSON per funzione) viene scritto dopo ogni record. Se il run si interrompe (crash, Ctrl+C, quota giornaliera) rilancia lo stesso comando: i record già presenti vengono saltati. `--no-resume` rielabora tutto.
 - **Non vengono scritti nel checkpoint** (così sono ritentati): quota giornaliera esaurita, chiave non valida, API non raggiungibile/sovraccarica dopo i retry. Risposte bloccate dai filtri o non parsabili sono registrate come `UNDETERMINABLE` con `parse_error=true`.
@@ -111,6 +113,10 @@ Opzioni: `--only-disagreements`, `--include-parse-errors`, `--repo-map` (JSON `{
 | `--workers` | `4` | Richieste parallele |
 | `--rpm` | `10` | Tetto richieste/minuto lato client (0 = nessun tetto). **Impostalo al limite del tuo account** |
 | `--temperature` / `--seed` | `0.2` / `42` | Campionamento / riproducibilità |
+| `--votes` | `1` | Risposte per funzione per il voto di maggioranza (dispari; 3 = massima precisione, 3× chiamate) |
+| `--no-commit-verdict` | `False` | Non caratterizzare il commit una volta (solo ablazione) |
+| `--no-schema` | `False` | Non inviare `responseSchema` |
+| `--retry-errors` | `False` | Al resume, ririchiede i record con `parse_error` |
 | `--timeout` | `300` | Timeout per richiesta (s) |
 | `--retries` | `5` | Tentativi su errori transitori (5xx/rete), back-off esponenziale |
 | `--max-output-tokens` | `32768` | Token massimi in output (thinking incluso) |
@@ -131,14 +137,18 @@ vuln_label_analyzer/
 ├── stats.py             # unico modulo di misura: summary / export-review / review
 ├── core/
 │   ├── llm_engine.py    # client Gemini: rate limiter, gestione 429, retry
-│   ├── pipeline.py      # pre-filtro + chiamate API + checkpoint/resume
+│   ├── commit_verdict.py # verdetto di commit: una chiamata per commit, cache + disco
+│   ├── pipeline.py      # pre-filtro + chiamate API + voto + checkpoint/resume
 │   ├── deterministic.py # pre-filtro senza API
 │   ├── prompting.py     # prompt + tassonomia
 │   ├── parser.py        # parsing/validazione della risposta
 │   ├── checkpoint.py    # JSONL incrementale
 │   └── ingestion.py     # lettura enriched.jsonl
 ├── dv_enricher/         # Passo 1: arricchimento (python -m dv_enricher)
+│   └── funcspan.py      # funzioni C/C++ e diff confrontando la coppia pre/post-fix
 ├── tests/test_pipeline.py   # python -m unittest discover -s tests -v  (mock API, nessuna rete)
 ├── tests/test_diff_scope.py # diff ristretto alla funzione, prompt, thinking, --refresh, repo git reale
+├── tests/test_function_pair.py # coppia pre/post-fix su repo git reali (riscrittura, file spostato, funzione rimossa)
+├── tests/test_consistency.py   # un verdetto per commit, retry, voto di maggioranza
 └── data/output/         # checkpoint e risultati
 ```

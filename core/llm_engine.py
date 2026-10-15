@@ -67,8 +67,8 @@ class LLMConfig:
     model_name: str = "gemini-3.5-flash"
     api_key: str | None = field(default=None, repr=False)
     base_url: str = "https://generativelanguage.googleapis.com"
-    temperature: float = 1
-    seed: int = 55
+    temperature: float = 0.2            # basso: stesso input -> stessa etichetta (riproducibilità)
+    seed: int = 42
     max_output_tokens: int = 32768      # thinking tokens included (high thinking can use a lot)
     timeout: float = 300                # seconds per request
     retries: int = 5                    # attempts on transient errors (5xx / network)
@@ -77,6 +77,9 @@ class LLMConfig:
     # "minimal" | "low" | "medium" | "high"; None = model default.  Default "high": the labelling
     # task needs real deliberation (the answer fields are the final analysis, not a scratchpad).
     thinking_level: str | None = "high"
+    # Output strutturato (responseSchema): JSON sempre valido e `category` sempre dentro l'enum.
+    # Disattivalo (--no-schema) per modelli che non lo supportano.
+    structured_output: bool = True
 
 
 _logged_first_call = False
@@ -166,24 +169,49 @@ def _get_limiter(cfg: LLMConfig) -> RateLimiter:
 # ---------------------------------------------------------------------------
 # Request / response helpers
 # ---------------------------------------------------------------------------
-def build_request_body(prompt: str, cfg: LLMConfig) -> Dict[str, Any]:
+def build_request_body(prompt: str, cfg: LLMConfig, *, system: Optional[str] = None,
+                       schema: Optional[Dict[str, Any]] = None,
+                       temperature: Optional[float] = None, seed: Optional[int] = None,
+                       max_output_tokens: Optional[int] = None) -> Dict[str, Any]:
+    """Corpo della richiesta generateContent.
+
+    `system` va in `systemInstruction` (le regole statiche restano separate dai dati del
+    record: più aderenza alle istruzioni e prefisso cacheable); `schema` attiva l'output
+    strutturato se `cfg.structured_output`.
+    """
     gen: Dict[str, Any] = {
-        "temperature": cfg.temperature,
-        "seed": cfg.seed,
-        "maxOutputTokens": cfg.max_output_tokens,
+        "temperature": cfg.temperature if temperature is None else temperature,
+        "seed": cfg.seed if seed is None else seed,
+        "maxOutputTokens": cfg.max_output_tokens if max_output_tokens is None else max_output_tokens,
         "responseMimeType": "application/json",   # the prompt already asks for a JSON object
     }
+    if schema and cfg.structured_output:
+        gen["responseSchema"] = schema
     if cfg.thinking_level:
         gen["thinkingConfig"] = {"thinkingLevel": cfg.thinking_level}
-    return {
+    body: Dict[str, Any] = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": gen,
         "safetySettings": _SAFETY_SETTINGS,
     }
+    if system:
+        body["systemInstruction"] = {"parts": [{"text": system}]}
+    return body
 
 
-def extract_text(data: Dict[str, Any]) -> str:
-    """Return the answer text of a generateContent response (thought parts excluded).
+@dataclass
+class LLMReply:
+    text: str
+    finish_reason: Optional[str] = None
+
+    @property
+    def truncated(self) -> bool:
+        """True se la risposta è stata tagliata dal limite di token (JSON quasi certamente rotto)."""
+        return self.finish_reason == "MAX_TOKENS"
+
+
+def extract_reply(data: Dict[str, Any]) -> LLMReply:
+    """Return the answer text + finishReason of a generateContent response (thought parts excluded).
 
     Raises RuntimeError (record-level failure) when the answer was blocked or is empty.
     """
@@ -209,7 +237,11 @@ def extract_text(data: Dict[str, Any]) -> str:
         if finish in _BLOCK_FINISH_REASONS:
             raise RuntimeError(f"Gemini blocked the response (finishReason={finish})")
         raise RuntimeError(f"Gemini returned an empty response (finishReason={finish})")
-    return text
+    return LLMReply(text, finish)
+
+
+def extract_text(data: Dict[str, Any]) -> str:
+    return extract_reply(data).text
 
 
 def _error_info(body: bytes) -> Tuple[str, str, Dict[str, Any]]:
@@ -275,8 +307,15 @@ def _is_auth_problem(code: int, message: str, err: Dict[str, Any]) -> bool:
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
-def query_llm(prompt: str, cfg: LLMConfig) -> str:
+def query_llm(prompt: str, cfg: LLMConfig, **kw: Any) -> str:
     """Send `prompt` to Gemini and return the answer text (JSON string)."""
+    return query_llm_ex(prompt, cfg, **kw).text
+
+
+def query_llm_ex(prompt: str, cfg: LLMConfig, *, system: Optional[str] = None,
+                 schema: Optional[Dict[str, Any]] = None, temperature: Optional[float] = None,
+                 seed: Optional[int] = None, max_output_tokens: Optional[int] = None) -> LLMReply:
+    """Come query_llm, ma restituisce anche il finishReason (serve a riconoscere MAX_TOKENS)."""
     _log_first_call(cfg)
     if not cfg.api_key:
         raise LLMFatalError("Gemini API key missing (set GEMINI_API_KEY or GOOGLE_API_KEY)")
@@ -285,7 +324,9 @@ def query_llm(prompt: str, cfg: LLMConfig) -> str:
         f"{cfg.base_url.rstrip('/')}/v1beta/models/"
         f"{cfg.model_name}:generateContent"
     )
-    payload = json.dumps(build_request_body(prompt, cfg)).encode("utf-8")
+    payload = json.dumps(build_request_body(
+        prompt, cfg, system=system, schema=schema, temperature=temperature, seed=seed,
+        max_output_tokens=max_output_tokens)).encode("utf-8")
     headers = {"Content-Type": "application/json", "x-goog-api-key": cfg.api_key}
     limiter = _get_limiter(cfg)
 
@@ -299,7 +340,7 @@ def query_llm(prompt: str, cfg: LLMConfig) -> str:
         try:
             with urllib.request.urlopen(req, timeout=cfg.timeout) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
-            return extract_text(data)
+            return extract_reply(data)
 
         except urllib.error.HTTPError as exc:
             body = exc.read()

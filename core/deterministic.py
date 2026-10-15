@@ -592,9 +592,9 @@ def deterministic_classify(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         # Tassonomia DiverseVul
         "category":        category,
         # Ragionamento
-        "step_1_commit_analysis":        "",
-        "step_2_function_diff_analysis": f"[deterministico] {reason}",
-        "step_3_conclusion":             f"[deterministico] {category} — {reason}",
+        "step_1_change":   "",
+        "step_2_flaw":     f"[deterministico] {reason}",
+        "step_3_role":     f"[deterministico] {category} — {reason}",
         "raw_output":      None,
         "parse_error":     False,
         "parse_error_reason": "",
@@ -607,6 +607,49 @@ def deterministic_classify(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "share_of_source_churn":  change.get("share_of_source_churn"),
         "frac_changed":           change.get("frac_changed"),
         "kind":                   kind,
+        "siblings_count":         len(record.get("siblings") or []),
+        "name_in_message":        signals.get("name_in_message"),
+        "cwe_matches_nvd":        signals.get("cwe_matches_nvd"),
+        "cwe_missing":            signals.get("cwe_missing_in_dataset", False),
+    }
+
+
+def undeterminable_no_diff(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Risultato per un record il cui diff non è attribuibile con sicurezza alla funzione.
+
+    Nessuna chiamata API: il modello non avrebbe evidenza e produrrebbe una congettura.
+    `predicted_target=-1` (escluso dal denominatore), `parse_error=False`.
+    """
+    change = record.get("change") or {}
+    location = record.get("location") or {}
+    signals = record.get("signals") or {}
+    reason = (f"diff non attribuibile con sicurezza alla funzione "
+              f"(diff_method={change.get('diff_method')!r}, "
+              f"diff_reliable={change.get('diff_reliable')!r})")
+    return {
+        "hash":            record.get("hash"),
+        "commit_id":       record.get("commit_id"),
+        "project":         record.get("project"),
+        "func_name":       record.get("func_name"),
+        "file":            location.get("file"),
+        "original_target": _to_int(record.get("target"), -1),
+        "predicted_target": -1,
+        "is_noise":        False,
+        "category":        "UNDETERMINABLE",
+        "step_1_change":   "",
+        "step_2_flaw":     f"[deterministico] {reason}",
+        "step_3_role":     f"[deterministico] UNDETERMINABLE — {reason}",
+        "raw_output":      None,
+        "parse_error":     False,
+        "parse_error_reason": "",
+        "method":          "deterministic",
+        "prefilter_rules":      ["diff_unrecoverable"],
+        "prefilter_confidence": "high",
+        "diff_method":     change.get("diff_method"),
+        "rank_in_commit":         change.get("rank_in_commit"),
+        "share_of_source_churn":  change.get("share_of_source_churn"),
+        "frac_changed":           change.get("frac_changed"),
+        "kind":                   _norm_str(change.get("kind")),
         "siblings_count":         len(record.get("siblings") or []),
         "name_in_message":        signals.get("name_in_message"),
         "cwe_matches_nvd":        signals.get("cwe_matches_nvd"),

@@ -243,3 +243,32 @@ def shrink_lines(text: str, limit: int, head_frac: float = 0.7) -> tuple[str, bo
         return text, False, 0
     tail.reverse()
     return "\n".join(head + [f"[... {omitted} diff lines omitted ...]"] + tail), True, omitted
+
+
+def map_line(hunks: list[Hunk], line: int, side: str = "old") -> int:
+    """Posizione approssimata sull'altro lato di `line` (1-based) di `side`.
+
+    Somma lo scostamento (righe aggiunte - cancellate) degli hunk che stanno interamente
+    prima della riga: serve a scegliere la controparte giusta quando un nome compare più volte.
+    """
+    delta = 0
+    for h in hunks:
+        if side == "old":
+            end = h.old_start + max(h.old_len, 1) - 1
+            if end < line:
+                delta += h.new_len - h.old_len
+        else:
+            end = h.new_start + max(h.new_len, 1) - 1
+            if end < line:
+                delta += h.old_len - h.new_len
+    return max(line + delta, 1)
+
+
+def anchored_is_plausible(deleted: int, inserted: int, length: int) -> bool:
+    """Un diff ancorato per righe è credibile solo se le dimensioni sono compatibili con la funzione.
+
+    Non si possono cancellare più righe di quante la funzione ne abbia, né aggiungerne una
+    quantità sproporzionata: è il segno tipico di un blocco di modifica esteso su più funzioni
+    (es. una libreria riscritta), dove le righe '+' finiscono attribuite alla funzione sbagliata.
+    """
+    return deleted <= length and inserted <= 2 * length + 10
