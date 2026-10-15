@@ -1,0 +1,99 @@
+# =============================================================================
+# VulnLabelAnalyzer - .gitignore
+# Tiene solo il codice del framework: niente dati, repository clonati, output
+# di run, chiavi API o file generati.
+# =============================================================================
+
+# --- Segreti / configurazione locale (NON committare mai la chiave API) ------
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets.*
+.secrets/
+
+# --- Dataset DiverseVul (pesante, scaricabile dalla fonte) -------------------
+diversevul_*.zip
+diversevul_*.json
+diversevul_*.jsonl
+*.zip
+*.tar.gz
+*.tgz
+
+# --- Output del passo 1 (dv_enricher) ----------------------------------------
+enriched.jsonl
+enriched*.jsonl
+work/
+.dv_cache/
+
+# --- Output del passo 2 (main.py) e del passo 3 (stats.py) -------------------
+# Tutto data/output/ e' generato; si tiene solo la cartella vuota.
+data/output/*
+!data/output/.gitkeep
+
+# Se usi un --out-dir diverso da data/output/, questi file restano esclusi:
+checkpoint.jsonl
+checkpoint*.jsonl
+results.csv
+results_full.jsonl
+accuracy_summary.json
+stats_report.txt
+review_llm.csv
+review_static.csv
+review_metrics.txt
+review_metrics.json
+
+# Eccezione: fixture di test (piccole, versionate)
+!tests/**/*.jsonl
+!tests/**/*.json
+!tests/**/*.zip
+
+# --- Python -------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+.venv/
+venv/
+env/
+ENV/
+
+# --- Test, coverage, linting ---------------------------------------------------
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+
+# --- Notebook ------------------------------------------------------------------
+.ipynb_checkpoints/
+
+# --- Log e temporanei ---------------------------------------------------------
+*.log
+*.tmp
+*.bak
+*.orig
+tmp/
+temp/
+
+# --- IDE / editor --------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- Sistema operativo ---------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,98 @@
+{
+  "linux": [
+    "https://github.com/torvalds/linux"
+  ],
+  "linux-2.6": [
+    "https://github.com/torvalds/linux"
+  ],
+  "php-src": [
+    "https://github.com/php/php-src"
+  ],
+  "openssl": [
+    "https://github.com/openssl/openssl"
+  ],
+  "tensorflow": [
+    "https://github.com/tensorflow/tensorflow"
+  ],
+  "ImageMagick": [
+    "https://github.com/ImageMagick/ImageMagick"
+  ],
+  "qemu": [
+    "https://github.com/qemu/qemu"
+  ],
+  "qpdf": [
+    "https://github.com/qpdf/qpdf"
+  ],
+  "envoy": [
+    "https://github.com/envoyproxy/envoy"
+  ],
+  "vim": [
+    "https://github.com/vim/vim"
+  ],
+  "tcpdump": [
+    "https://github.com/the-tcpdump-group/tcpdump"
+  ],
+  "libxml2": [
+    "https://github.com/GNOME/libxml2"
+  ],
+  "FreeRDP": [
+    "https://github.com/FreeRDP/FreeRDP"
+  ],
+  "FFmpeg": [
+    "https://github.com/FFmpeg/FFmpeg"
+  ],
+  "samba": [
+    "https://github.com/samba-team/samba"
+  ],
+  "postgres": [
+    "https://github.com/postgres/postgres"
+  ],
+  "krb5": [
+    "https://github.com/krb5/krb5"
+  ],
+  "mysql-server": [
+    "https://github.com/mysql/mysql-server"
+  ],
+  "mongo": [
+    "https://github.com/mongodb/mongo"
+  ],
+  "librsvg": [
+    "https://github.com/GNOME/librsvg"
+  ],
+  "curl": [
+    "https://github.com/curl/curl"
+  ],
+  "redis": [
+    "https://github.com/redis/redis"
+  ],
+  "openjpeg": [
+    "https://github.com/uclouvain/openjpeg"
+  ],
+  "gnutls": [
+    "https://github.com/gnutls/gnutls"
+  ],
+  "ceph": [
+    "https://github.com/ceph/ceph"
+  ],
+  "libvncserver": [
+    "https://github.com/LibVNC/libvncserver"
+  ],
+  "systemd": [
+    "https://github.com/systemd/systemd"
+  ],
+  "gnupg": [
+    "https://github.com/gpg/gnupg"
+  ],
+  "git": [
+    "https://github.com/git/git"
+  ],
+  "libarchive": [
+    "https://github.com/libarchive/libarchive"
+  ],
+  "wireshark": [
+    "https://github.com/wireshark/wireshark"
+  ],
+  "busybox": [
+    "https://github.com/mirror/busybox"
+  ]
+}
