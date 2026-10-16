@@ -1,43 +1,58 @@
-"""Classification pipeline: records -> deterministic pre-filter / LLM API -> checkpoint.
+"""Classification pipeline: records -> rule pre-check / LLM API -> checkpoint.
 
 One run = one model, one checkpoint, one set of outputs.
+Exactly ONE LLM request is made per function that reaches the model (no voting, no re-asking
+on unparsable output).
+
+Scheduling: per-commit, bottom-up
+---------------------------------
+The prompt shows, for every callee / caller of the function, the label already issued for it
+("label so far", ``pending`` otherwise). That only works if callees are analysed before their
+callers, so the unit of parallel work is the COMMIT, not the function:
+
+  * commits run in parallel (one worker thread per commit at a time);
+  * inside a commit, functions are processed sequentially in call-graph order (callees first,
+    ``CommitGraph.pos``), and every verdict is fed back as a label to the functions that follow;
+  * functions of commits without a call graph are independent single-function units.
+
+The labels visible to a function are: verdicts already in the checkpoint (resume), all
+rule-based verdicts of the commit (they do not depend on the model), and the verdicts issued
+earlier in this run for the same commit. Unparsable answers and transient failures do not
+produce a label (the neighbour stays ``pending``).
 
 Resume
 ------
 The checkpoint is one JSON object per line, keyed by ``hash``. Records whose hash is already
 in the checkpoint are skipped, so an interrupted run (crash, Ctrl+C, exhausted daily quota)
-continues from where it stopped. Every reader accesses fields with ``.get``, so checkpoints
-written by older versions keep working.
+continues from where it stopped; checkpointed verdicts are re-used as neighbour labels.
+Every reader accesses fields with ``.get``, so checkpoints written by older versions keep working.
 
 What is NOT written to the checkpoint (so it is retried on the next run):
-daily quota exhausted, invalid key, API unreachable/overloaded after the retries.
+daily quota exhausted, invalid key, API unreachable/overloaded after the transport retries.
 Blocked or unparsable answers are recorded as ``UNDETERMINABLE`` with ``parse_error=true``
-(``retry_errors=True`` re-queries them on resume).
+(``retry_errors=True`` re-queries them on resume; this is the only way a function gets a 2nd call).
 """
 from __future__ import annotations
 
-import concurrent.futures
 import sys
 import threading
 import time
 from collections import defaultdict
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional
 
-from .callgraph import CommitGraph, build_graphs, commit_key, result_fields, summarize_graphs
+from .callgraph import SummaryCache, build_graphs, commit_key, result_fields, summarize_graphs
 from .checkpoint import CheckpointWriter, load_checkpoint_deduped
-from .deterministic import deterministic_classify, undeterminable_no_diff
 from .llm_engine import LLMAbort, LLMConfig, LLMTransientError, query_llm_ex
-from .parser import parse_llm_response
-from .prompting import (GEMINI_RESPONSE_SCHEMA, PROMPT_VERSION, aggregate_votes, analyze_record,
-                        build_messages, diff_available, prompt_meta)
+from .prompting import (DEFAULT_CONFIG, PROMPT_VERSION, RESPONSE_JSON_SCHEMA, PromptBuilder,
+                        PromptConfig, analyze_record, parse_llm_output, precheck, prompt_meta)
 
-MAX_CONSECUTIVE_TRANSIENT = 8   # stop after this many back-to-back transient failures
-MAX_PARSE_ATTEMPTS = 3          # new samples for the same prompt when the answer is not parsable
-VOTE_MIN_TEMPERATURE = 0.7      # with votes > 1 the samples must differ, otherwise voting is moot
+MAX_CONSECUTIVE_TRANSIENT = 8      # stop after this many back-to-back transient failures
 ENRICH_SCHEMA_WITH_PAIR_DIFF = 3   # first enricher schema with reliable function-level diffs
+LLM_METHOD = "llm"
+RULE_METHOD = "rule"               # results of prompting.precheck (Rules 0 / 1 / comment-only)
 
 
 # ---------------------------------------------------------------------------
@@ -56,96 +71,23 @@ class RunOutcome:
 
 
 # ---------------------------------------------------------------------------
-# Record processing
+# Result construction
 # ---------------------------------------------------------------------------
-def _ask_once(msgs: Dict[str, str], cfg: LLMConfig, *, seed: int, temperature: float
-              ) -> Dict[str, Any]:
-    """One answer for the prompt; up to MAX_PARSE_ATTEMPTS tries if the output is not parsable
-    (a cut-off answer, MAX_TOKENS, is retried with a doubled output budget)."""
-    budget = cfg.max_output_tokens
-    parsed: Dict[str, Any] = {}
-    attempts = 0
-    for k in range(MAX_PARSE_ATTEMPTS):
-        reply = query_llm_ex(msgs["user"], cfg, system=msgs["system"],
-                             schema=GEMINI_RESPONSE_SCHEMA, temperature=temperature,
-                             seed=seed + k, max_output_tokens=budget)
-        attempts += 1
-        parsed = parse_llm_response(reply.text)
-        if not parsed["parse_error"]:
-            break
-        if reply.truncated:
-            budget = min(budget * 2, 65536)
-    parsed["attempts"] = attempts
-    return parsed
-
-
-def _combine(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Majority vote over the samples (parse failures ignored)."""
-    valid = [p for p in samples if not p["parse_error"]]
-    if not valid:
-        return {**samples[0], "n_votes": len(samples), "agreement": 0.0, "vote_counts": {},
-                "vote_tie": False, "all_parse_errors": True}
-    if len(samples) == 1:
-        return {**valid[0], "n_votes": 1, "agreement": 1.0,
-                "vote_counts": {valid[0]["category"]: 1}, "vote_tie": False,
-                "all_parse_errors": False}
-    agg = aggregate_votes(valid)
-    if agg["tie"]:
-        rep = dict(valid[0])
-        if not agg["target_tie"]:
-            binary_target = agg["predicted_target"]
-            rep.update(category="UNDETERMINABLE", predicted_target=binary_target)
-            return {**rep, "n_votes": len(samples), "agreement": agg["agreement"],
-                    "vote_counts": agg["counts"], "vote_tie": False, "category_tie": True,
-                    "all_parse_errors": False}
-        rep.update(category="UNDETERMINABLE", predicted_target=-1)
-        return {**rep, "n_votes": len(samples), "agreement": agg["agreement"],
-                "vote_counts": agg["counts"], "vote_tie": True, "category_tie": True,
-                "all_parse_errors": False}
-    rep = next(p for p in valid if p["category"] == agg["category"])
-    return {**rep, "n_votes": len(samples), "agreement": agg["agreement"],
-            "vote_counts": agg["counts"], "vote_tie": False, "category_tie": False,
-            "all_parse_errors": False}
-
-
-def _needs_escalation(sample: Dict[str, Any], original_target: int) -> bool:
-    if sample["parse_error"] or sample["category"] == "UNDETERMINABLE":
-        return True
-    return sample["predicted_target"] != original_target
-
-
-def process_record(record: Dict[str, Any], cfg: LLMConfig, *,
-                   votes: int = 1,
-                   vote_policy: str = "always",
-                   graph_ctx: Optional[Dict[str, Any]] = None,
-                   graphs: Optional[Dict[str, CommitGraph]] = None,
-                   analyzed: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, Any]:
-    """Full LLM cycle for a single record. Returns a result dict."""
-    if graph_ctx is None and graphs is not None and analyzed is not None:
-        g = graphs.get(commit_key(record))
-        if g is not None:
-            graph_ctx = g.context_for(str(record.get("hash", "")), analyzed)
-
-    diff_ctx = analyze_record(record)
-    msgs = build_messages(record, ctx=diff_ctx, graph_ctx=graph_ctx)
-    meta = prompt_meta(record, ctx=diff_ctx, graph_ctx=graph_ctx)
-
-    votes = max(1, int(votes))
-    temperature = cfg.temperature if votes == 1 else max(cfg.temperature, VOTE_MIN_TEMPERATURE)
+def _result(record: Dict[str, Any], verdict: Dict[str, Any], meta: Dict[str, Any], *,
+            method: str, model: Optional[str], thinking_level: Optional[str],
+            raw_output: Optional[str], output_truncated: bool) -> Dict[str, Any]:
+    """Checkpoint row from a verdict (``parse_llm_output`` or ``precheck``) and prompt metadata."""
+    data = verdict.get("data") or {}
     original_target = int(record.get("target", -1))
-    
-    samples = [_ask_once(msgs, cfg, seed=cfg.seed + 101 * 0, temperature=temperature)]
-    if votes > 1 and (vote_policy == "always" or _needs_escalation(samples[0], original_target)):
-        samples += [_ask_once(msgs, cfg, seed=cfg.seed + 101 * i, temperature=temperature)
-                    for i in range(1, votes)]
-    parsed = _combine(samples)
+    failed = bool(verdict.get("parse_error"))
+    # an unparsable answer must never count as "noise"
+    category = "UNDETERMINABLE" if failed else verdict["category"]
+    predicted_target = -1 if failed else verdict["predicted_target"]
+    is_noise = (not failed) and predicted_target != -1 and predicted_target != original_target
 
-    predicted_target = parsed["predicted_target"]
     change = record.get("change") or {}
     signals = record.get("signals") or {}
     location = record.get("location") or {}
-
-    is_noise = original_target != predicted_target and predicted_target != -1
 
     return {
         "hash": record.get("hash"),
@@ -156,45 +98,69 @@ def process_record(record: Dict[str, Any], cfg: LLMConfig, *,
         "original_target": original_target,
         "predicted_target": predicted_target,
         "is_noise": is_noise,
-        "category": parsed["category"],
-        "method": "llm",
-        "model": cfg.model_name,
-        "thinking_level": getattr(cfg, 'thinking_level', None),
-        "prompt_version": meta["prompt_version"],
-        "diff_truncated": meta["diff_truncated"],
-        "diff_method": meta["diff_method"],
-        # call graph context & traceability
-        **result_fields(graph_ctx),
+        "category": category,
+        "method": method,
+        "model": model,
+        "thinking_level": thinking_level,
+        # prompt version, diff status and call-graph traceability (n_labelled, ...)
+        **meta,
         # full reasoning
-        "step_1_change": parsed.get("step_1_change", ""),
-        "step_2_flaw":   parsed.get("step_2_flaw", ""),
-        "step_3_role":   parsed.get("step_3_role", ""),
-        "raw_output":         parsed.get("raw_output"),
-        "parse_error":        parsed["parse_error"],
-        "parse_error_reason": parsed.get("parse_error_reason", ""),
-        "attempts":           parsed.get("attempts", 1),
-        # self-consistency
-        "n_votes":         parsed["n_votes"],
-        "agreement":       parsed["agreement"],
-        "vote_counts":     parsed["vote_counts"],
-        "vote_tie":        parsed["vote_tie"],
-        "category_tie":    parsed.get("category_tie", False),
-        "all_parse_errors": parsed.get("all_parse_errors", False),
+        "step_1_change": data.get("step_1_change", ""),
+        "step_2_flaw": data.get("step_2_flaw", ""),
+        "step_3_role": data.get("step_3_role", ""),
+        "raw_output": raw_output,
+        "parse_error": failed,
+        "parse_error_reason": verdict.get("parse_error_reason", ""),
+        "parse_method": verdict.get("parse_method"),
+        "output_truncated": output_truncated,
+        # single-answer self-consistency
+        "rule": verdict.get("rule"),
+        "flaw_visible": verdict.get("flaw_visible"),
+        "flags": verdict.get("flags", []),
+        "inconsistent": verdict.get("inconsistent", False),
+        # constants kept so stats.py / older checkpoints stay compatible
+        "n_votes": 1,
+        "agreement": 1.0,
         # enricher signals (downstream analysis)
-        "rank_in_commit":        change.get("rank_in_commit"),
+        "rank_in_commit": change.get("rank_in_commit"),
         "share_of_source_churn": change.get("share_of_source_churn"),
-        "frac_changed":          change.get("frac_changed"),
-        "kind":                  change.get("kind"),
-        "siblings_count":        len(record.get("siblings", [])),
-        "name_in_message":       signals.get("name_in_message"),
-        "cwe_matches_nvd":       signals.get("cwe_matches_nvd"),
-        "cwe_missing":           signals.get("cwe_missing_in_dataset", False),
+        "frac_changed": change.get("frac_changed"),
+        "kind": change.get("kind"),
+        "siblings_count": len(record.get("siblings", [])),
+        "name_in_message": signals.get("name_in_message"),
+        "cwe_matches_nvd": signals.get("cwe_matches_nvd"),
+        "cwe_missing": signals.get("cwe_missing_in_dataset", False),
     }
+
+
+def process_record(record: Dict[str, Any], cfg: LLMConfig, *, builder: PromptBuilder,
+                   graph_ctx: Optional[Dict[str, Any]] = None,
+                   ctx: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """One LLM request for a single record. Returns a result row."""
+    ctx = ctx if ctx is not None else analyze_record(record, builder.cfg)
+    prompt = builder.build(record, ctx, graph_ctx)
+    meta = prompt_meta(record, ctx, graph_ctx, builder.cfg)
+
+    reply = query_llm_ex(prompt.content, cfg, system=prompt.instructions,
+                         schema=RESPONSE_JSON_SCHEMA, temperature=cfg.temperature,
+                         seed=cfg.seed, max_output_tokens=cfg.max_output_tokens)
+    verdict = parse_llm_output(reply.text)
+    return _result(record, verdict, meta, method=LLM_METHOD, model=cfg.model_name,
+                   thinking_level=getattr(cfg, "thinking_level", None),
+                   raw_output=reply.text, output_truncated=bool(getattr(reply, "truncated", False)))
+
+
+def _rule_result(record: Dict[str, Any], verdict: Dict[str, Any], ctx: Dict[str, Any],
+                 graph_ctx: Optional[Dict[str, Any]], config: PromptConfig) -> Dict[str, Any]:
+    """Row for a verdict issued by ``prompting.precheck`` (no API call)."""
+    meta = prompt_meta(record, ctx, graph_ctx, config)
+    return _result(record, verdict, meta, method=RULE_METHOD, model=None, thinking_level=None,
+                   raw_output=None, output_truncated=False)
 
 
 def _error_record(rec: Dict[str, Any], exc: Exception, model: str,
                   graph_ctx: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Minimal record so that a record-level failure is checkpointed."""
+    """Minimal row so that a record-level failure is checkpointed."""
     return {
         "hash": rec.get("hash"),
         "commit_id": rec.get("commit_id"),
@@ -204,7 +170,7 @@ def _error_record(rec: Dict[str, Any], exc: Exception, model: str,
         "predicted_target": -1,
         "is_noise": False,
         "category": "UNDETERMINABLE",
-        "method": "llm",
+        "method": LLM_METHOD,
         "model": model,
         "prompt_version": PROMPT_VERSION,
         "parse_error": True,
@@ -214,8 +180,21 @@ def _error_record(rec: Dict[str, Any], exc: Exception, model: str,
     }
 
 
+def _label_of(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Neighbour label ("label so far") derived from a result row / checkpoint row.
+
+    Keys match what ``prompting._label_text`` reads: category, source, rule, flaw_visible."""
+    return {
+        "category": result.get("category"),
+        "source": "llm" if result.get("method") == LLM_METHOD else "rule",
+        "rule": result.get("rule"),
+        "flaw_visible": result.get("flaw_visible"),
+        "predicted_target": result.get("predicted_target"),
+    }
+
+
 # ---------------------------------------------------------------------------
-# Progress
+# Progress and shared run state
 # ---------------------------------------------------------------------------
 def _progress(done: int, total: int, t0: float) -> None:
     elapsed = time.time() - t0
@@ -230,38 +209,70 @@ def _log(msg: str) -> None:
     print(msg, file=sys.stderr)
 
 
-def estimate_calls(n_records: int, votes: int, vote_policy: str, noise_rate: float = 0.35) -> Dict[str, float]:
-    lo = n_records
-    hi = n_records * max(1, votes)
-    if votes <= 1:
-        exp = hi
-    elif vote_policy == "always":
-        exp = hi
-    else:
-        exp = n_records * (1 + noise_rate * (votes - 1))
-    return {"min": lo, "expected": exp, "max": hi}
-
-
 def _fmt_hours(h: float) -> str:
     return f"{h * 60:.0f} min" if h < 1 else f"{h:.1f} h"
 
 
-def _log_estimate(n_records: int, votes: int, vote_policy: str, cfg: LLMConfig) -> None:
-    if n_records <= 0:
+def _log_estimate(n_calls: int, cfg: LLMConfig) -> None:
+    if n_calls <= 0:
         return
-    est = estimate_calls(n_records, votes, vote_policy)
-    if getattr(cfg, 'rpm', None) and cfg.rpm > 0:
-        floor = {k: v / cfg.rpm / 60 for k, v in est.items()}
-        _log(f"  → estimate: ~{est['expected']:.0f} API calls ({est['min']:.0f}-{est['max']:.0f}); "
-             f"at rpm={cfg.rpm:g} that is >= {_fmt_hours(floor['expected'])} "
-             f"(best case {_fmt_hours(floor['min'])}, worst {_fmt_hours(floor['max'])}) "
-             f"before any retry")
-        if floor["expected"] > 12:
-            _log("  ⚠ the rpm cap, not the workers, bounds the run: check your real quota "
-                 "(AI Studio -> Rate limits), use --votes 1 / --vote-policy adaptive, lower "
-                 "--thinking for a first pass, or split the run")
+    rpm = getattr(cfg, "rpm", None)
+    if rpm and rpm > 0:
+        _log(f"  → {n_calls} API calls (exactly one per function); at rpm={rpm:g} that is "
+             f">= {_fmt_hours(n_calls / rpm / 60)} before any transport retry")
     else:
-        _log(f"  → estimate: ~{est['expected']:.0f} API calls ({est['min']:.0f}-{est['max']:.0f})")
+        _log(f"  → {n_calls} API calls (exactly one per function)")
+
+
+@dataclass
+class _RunState:
+    """Counters shared by the worker threads; every mutation (and checkpoint write) is locked."""
+    total: int
+    written: int = 0
+    done: int = 0
+    consecutive_transient: int = 0
+    status: str = "completed"
+    reason: str = ""
+    t0: float = field(default_factory=time.time)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def record(self, ckpt: CheckpointWriter, result: Dict[str, Any]) -> None:
+        with self.lock:
+            ckpt.write(result)
+            self.written += 1
+            self.done += 1
+            self.consecutive_transient = 0
+            _progress(self.done, self.total, self.t0)
+
+    def transient(self, rec: Dict[str, Any], exc: Exception, stop: threading.Event) -> None:
+        with self.lock:
+            self.done += 1
+            self.consecutive_transient += 1
+            _log(f"\n  [transient] hash={rec.get('hash')} NOT checkpointed "
+                 f"(will be retried on resume): {exc}")
+            if self.consecutive_transient >= MAX_CONSECUTIVE_TRANSIENT:
+                stop.set()
+                self.status = "stopped"
+                self.reason = (f"{MAX_CONSECUTIVE_TRANSIENT} consecutive transient "
+                               f"failures — API seems down: {exc}")
+            _progress(self.done, self.total, self.t0)
+
+    def abort(self, exc: Exception, stop: threading.Event) -> None:
+        stop.set()
+        with self.lock:
+            self.done += 1
+            if self.status != "stopped":
+                self.status = "stopped"
+                self.reason = f"{type(exc).__name__}: {exc}"
+            _progress(self.done, self.total, self.t0)
+
+
+@dataclass
+class _Unit:
+    """Work processed by ONE thread, strictly in order (callees before callers)."""
+    records: List[Dict[str, Any]]
+    graph: Any = None                                         # CommitGraph or None
+    labels: Dict[str, Dict[str, Any]] = field(default_factory=dict)   # seed labels of the commit
 
 
 # ---------------------------------------------------------------------------
@@ -276,235 +287,180 @@ def run_pipeline(
     resume: bool = True,
     skip_deterministic: bool = False,
     stop: Optional[threading.Event] = None,
-    votes: int = 1,
     retry_errors: bool = False,
-    vote_policy: str = "adaptive",
     use_callgraph: bool = True,
+    prompt_config: PromptConfig = DEFAULT_CONFIG,
 ) -> RunOutcome:
     """Classify `records` with `cfg`, appending every result to `checkpoint`."""
     out = RunOutcome(n_selected=len(records))
     stop = stop or threading.Event()
+    builder = PromptBuilder(prompt_config)
 
-    # --- resume: skip what is already in the checkpoint ---
+    # --- resume: skip what is already in the checkpoint, keep its verdicts as neighbour labels ---
     already_done: set[str] = set()
-    previous: List[Dict[str, Any]] = []
+    known_labels: Dict[str, Dict[str, Any]] = {}
     if resume and checkpoint.exists():
         previous = load_checkpoint_deduped(checkpoint)
         retry = [r for r in previous if retry_errors and r.get("parse_error")]
         already_done = {str(r["hash"]) for r in previous} - {str(r["hash"]) for r in retry}
+        known_labels = {str(r["hash"]): _label_of(r) for r in previous
+                        if r.get("category") and not r.get("parse_error")}
         _log(f"  → resuming: {len(already_done)} hashes already in {checkpoint}"
              + (f" ({len(retry)} parse-error records will be retried)" if retry else ""))
         other = {r.get("model") for r in previous
-                 if r.get("method") == "llm" and r.get("model") not in (None, cfg.model_name)}
+                 if r.get("method") == LLM_METHOD and r.get("model") not in (None, cfg.model_name)}
         if other:
             _log(f"  ⚠ checkpoint also contains results from other model(s) {sorted(other)}; "
-                 f"they are kept and NOT re-run. Use a different --out-dir (or --no-resume) "
-                 f"to evaluate {cfg.model_name} on its own.")
+                 f"they are kept and NOT re-run (and serve as neighbour labels). Use a different "
+                 f"--out-dir (or --no-resume) to evaluate {cfg.model_name} on its own.")
         stale = sum(1 for r in previous
-                    if r.get("method") == "llm" and r.get("prompt_version") != PROMPT_VERSION)
+                    if r.get("method") == LLM_METHOD and r.get("prompt_version") != PROMPT_VERSION)
         if stale:
             _log(f"  ⚠ {stale} checkpoint results were produced with a different prompt version "
                  f"(current: {PROMPT_VERSION}); they are kept and NOT re-run. Use a new --out-dir "
                  f"(or --no-resume) to re-classify them with the current prompt.")
-    
+
     todo = [r for r in records if str(r.get("hash", "")) not in already_done]
     out.n_resumed = len(records) - len(todo)
     _log(f"  → {len(todo)} records remaining ({out.n_resumed} already done)")
 
-    # --- call graph: one CommitGraph per commit ---
+    # --- call graph: one CommitGraph per commit; neighbour summaries are deterministic ---
     graphs = build_graphs(records) if use_callgraph else {}
-    if use_callgraph and graphs:
+    summaries = SummaryCache(records) if graphs else None
+    if graphs:
         _log(f"  → call graph: {summarize_graphs(graphs)}")
 
-    analyzed: Dict[str, Dict[str, Any]] = {}
-    if previous:
-        for r in previous:
-            h = str(r.get("hash", ""))
-            if h and (not retry_errors or not r.get("parse_error")):
-                analyzed[h] = r
+    def plain_ctx(r: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Call-graph context without neighbour labels (for results that never reach the model)."""
+        g = graphs.get(commit_key(r))
+        return g.context_for(str(r.get("hash", "")), summaries) if g is not None else None
 
-    # --- deterministic pre-filter (no API call) ---
+    # --- rule-based pre-check (no API call) ---
     to_llm: List[Dict[str, Any]] = []
-    determ_results: List[Dict[str, Any]] = []
-    if skip_deterministic:
-        to_llm = todo
-    else:
-        for r in todo:
-            det = deterministic_classify(r)
-            if det is not None:
-                determ_results.append(det)
+    rule_results: List[Dict[str, Any]] = []
+    n_rule = n_unattributed = n_legacy = 0
+    for r in todo:
+        ctx = analyze_record(r, prompt_config)
+        if ctx["diff_kind"] == "unavailable":
+            # asking the model would only produce a guess
+            if int(r.get("schema_version") or 1) >= ENRICH_SCHEMA_WITH_PAIR_DIFF:
+                rule_results.append(_rule_result(r, precheck(r, ctx), ctx, plain_ctx(r), prompt_config))
+                n_unattributed += 1
             else:
-                to_llm.append(r)
-        _log(f"  → deterministic pre-filter: {len(determ_results)} classified, "
-             f"{len(to_llm)} sent to the API")
+                n_legacy += 1          # enriched with an old schema: not checkpointed
+            continue
+        if not skip_deterministic:
+            verdict = precheck(r, ctx)
+            if verdict is not None:
+                rule_results.append(_rule_result(r, verdict, ctx, plain_ctx(r), prompt_config))
+                n_rule += 1
+                continue
+        to_llm.append(r)
 
-    # records without a usable function diff: asking the model would only produce a guess
-    unusable = [r for r in to_llm if not diff_available(r)]
-    if unusable:
-        skip = {id(r) for r in unusable}
-        to_llm = [r for r in to_llm if id(r) not in skip]
-        final = [r for r in unusable
-                 if int(r.get("schema_version") or 1) >= ENRICH_SCHEMA_WITH_PAIR_DIFF]
-        final_ids = {id(r) for r in final}
-        legacy = [r for r in unusable if id(r) not in final_ids]
-        for r in final:
-            determ_results.append(undeterminable_no_diff(r))
-        if final:
-            _log(f"  → {len(final)} records recorded as UNDETERMINABLE: no diff could be "
-                 f"attributed to the function (function pair not found, ambiguous or "
-                 f"inconsistent); no API call")
-        if legacy:
-            out.n_no_diff = len(legacy)
-            _log(f"  ⚠ {len(legacy)} records skipped: their diff was truncated or not reliably "
-                 f"attributed to the function (enriched with an old schema). Re-run "
-                 f"`python -m dv_enricher ... --refresh`, then run again.")
+    if not skip_deterministic:
+        _log(f"  → rule-based pre-check: {n_rule} classified, {len(to_llm)} sent to the API")
+    if n_unattributed:
+        _log(f"  → {n_unattributed} records recorded as UNDETERMINABLE: no diff could be "
+             f"attributed to the function (function pair not found, ambiguous or "
+             f"inconsistent); no API call")
+    if n_legacy:
+        out.n_no_diff = n_legacy
+        _log(f"  ⚠ {n_legacy} records skipped: their diff was truncated or not reliably "
+             f"attributed to the function (enriched with an old schema). Re-run "
+             f"`python -m dv_enricher ... --refresh`, then run again.")
 
-    # Attach call graph context to deterministic results and register in analyzed
-    for det in determ_results:
-        h = str(det.get("hash", ""))
-        ck = commit_key(det)
-        g = graphs.get(ck)
-        cg = g.context_for(h, analyzed) if (g and use_callgraph) else None
-        det.update(result_fields(cg))
-        if h:
-            analyzed[h] = det
+    # rule-based verdicts do not depend on the model: they are visible as labels from the start
+    for res in rule_results:
+        known_labels[str(res["hash"])] = _label_of(res)
 
-    # Order to_llm so that within each commit, records follow g.order (callees first)
-    if use_callgraph:
-        to_llm.sort(key=lambda r: (
-            commit_key(r),
-            graphs[commit_key(r)].pos.get(str(r.get("hash", "")), 0) if commit_key(r) in graphs else 0
-        ))
-
-    # Dependency tracking for bottom-up analysis within each commit
-    deps: Dict[str, Set[str]] = {}
-    to_llm_hashes = {str(r.get("hash", "")) for r in to_llm}
-    rec_by_hash = {str(r.get("hash", "")): r for r in to_llm}
-
+    # --- work units: one per commit (callees first), singletons otherwise ---
+    use_labels = prompt_config.include_callgraph and prompt_config.include_neighbour_labels
+    by_commit: Dict[Any, List[Dict[str, Any]]] = defaultdict(list)
+    singles: List[_Unit] = []
     for r in to_llm:
-        h = str(r.get("hash", ""))
-        ck = commit_key(r)
-        g = graphs.get(ck)
-        if use_callgraph and g is not None and h in g.pos:
-            pos = g.pos[h]
-            commit_deps = {pred_h for pred_h in g.order[:pos] if pred_h in to_llm_hashes}
-            deps[h] = commit_deps
+        key = commit_key(r)
+        if key in graphs:
+            by_commit[key].append(r)
         else:
-            deps[h] = set()
+            singles.append(_Unit([r]))
 
-    remaining_deps = {h: set(d) for h, d in deps.items()}
-    dependents: Dict[str, List[str]] = defaultdict(list)
-    for h, ds in deps.items():
-        for d in ds:
-            dependents[d].append(h)
+    units: List[_Unit] = []
+    for key, recs in by_commit.items():
+        g = graphs[key]
+        # bottom-up: callees before callers (CommitGraph.pos is the call-graph order)
+        recs.sort(key=lambda r: g.pos.get(str(r.get("hash", "")), 0))
+        seed = {h: known_labels[h] for h in g.pos if h in known_labels} if use_labels else {}
+        units.append(_Unit(recs, g, seed))
+    units.sort(key=lambda u: len(u.records), reverse=True)   # longest chains first (less tail idle time)
+    units += singles
+    if units:
+        _log(f"  → {len(units)} work units ({len(by_commit)} commits processed callees-first, "
+             f"{len(singles)} independent functions)")
 
-    ready = [r for r in to_llm if not remaining_deps[str(r.get("hash", ""))]]
+    _log_estimate(len(to_llm), cfg)
 
-    _log_estimate(len(to_llm), votes, vote_policy, cfg)
-
-    written = 0
-    if todo:
-        t0 = time.time()
-        consecutive_transient = 0
-        n_done = 0
-        n_total = len(to_llm)
-        state_lock = threading.Lock()
-
-        def worker(r: Dict[str, Any]):
+    def run_unit(unit: _Unit, ckpt: CheckpointWriter, state: _RunState) -> None:
+        # labels is touched by this thread only; None -> prompt without neighbour labels
+        labels: Optional[Dict[str, Dict[str, Any]]] = dict(unit.labels) if use_labels else None
+        for r in unit.records:
             if stop.is_set():
-                return "skipped", r, None
+                return
             h = str(r.get("hash", ""))
-            ck = commit_key(r)
-            g = graphs.get(ck) if graphs else None
-            graph_ctx = None
-            if g is not None and use_callgraph:
-                with state_lock:
-                    snap = dict(analyzed)
-                graph_ctx = g.context_for(h, snap)
+            graph_ctx: Optional[Dict[str, Any]] = None
             try:
-                payload = process_record(
-                    r, cfg, votes=votes,
-                    vote_policy=vote_policy, graph_ctx=graph_ctx)
-                return "ok", r, payload
+                if unit.graph is not None:
+                    graph_ctx = (unit.graph.context_for(h, summaries, labels=labels)
+                                 if labels is not None else unit.graph.context_for(h, summaries))
+                result = process_record(r, cfg, builder=builder, graph_ctx=graph_ctx)
             except LLMAbort as exc:
-                stop.set()
-                return "abort", r, exc
+                state.abort(exc, stop)
+                return
             except LLMTransientError as exc:
-                return "transient", r, exc
+                state.transient(r, exc, stop)      # not checkpointed; stays `pending` for its callers
+                continue
             except Exception as exc:  # record-level failure -> checkpointed as UNDETERMINABLE
                 _log(f"\n  [error] hash={r.get('hash')}: {exc}")
-                return "error", r, _error_record(r, exc, cfg.model_name, graph_ctx=graph_ctx)
+                result = _error_record(r, exc, cfg.model_name, graph_ctx=graph_ctx)
+            state.record(ckpt, result)
+            if labels is not None and not result.get("parse_error"):
+                labels[h] = _label_of(result)      # visible to the functions that follow
 
+    if todo:
+        state = _RunState(total=len(to_llm))
+        interrupted = False
         with CheckpointWriter(checkpoint) as ckpt:
-            for det in determ_results:
-                ckpt.write(det)
-                written += 1
+            for res in rule_results:
+                ckpt.write(res)
+                state.written += 1
 
-            if to_llm:
+            if units:
                 executor = ThreadPoolExecutor(max_workers=max(1, workers))
-                active_futures: Dict[Any, Dict[str, Any]] = {}
+                futures = [executor.submit(run_unit, u, ckpt, state) for u in units]
                 try:
-                    for r in ready:
-                        fu = executor.submit(worker, r)
-                        active_futures[fu] = r
-
-                    while active_futures:
-                        done, _ = wait(active_futures.keys(), return_when=FIRST_COMPLETED)
-                        for fu in done:
-                            rec = active_futures.pop(fu)
-                            kind, _, payload = fu.result()
-                            if kind == "skipped":
-                                continue
-                            n_done += 1
-                            h = str(rec.get("hash", ""))
-                            if kind in ("ok", "error"):
-                                consecutive_transient = 0
-                                ckpt.write(payload)
-                                written += 1
-                                with state_lock:
-                                    analyzed[h] = payload
-                                    for dep_h in dependents.get(h, []):
-                                        remaining_deps[dep_h].discard(h)
-                                        if not remaining_deps[dep_h] and not stop.is_set():
-                                            nxt_rec = rec_by_hash[dep_h]
-                                            nxt_fu = executor.submit(worker, nxt_rec)
-                                            active_futures[nxt_fu] = nxt_rec
-                            elif kind == "transient":
-                                consecutive_transient += 1
-                                _log(f"\n  [transient] hash={rec.get('hash')} NOT checkpointed "
-                                     f"(will be retried on resume): {payload}")
-                                with state_lock:
-                                    for dep_h in dependents.get(h, []):
-                                        remaining_deps[dep_h].discard(h)
-                                        if not remaining_deps[dep_h] and not stop.is_set():
-                                            nxt_rec = rec_by_hash[dep_h]
-                                            nxt_fu = executor.submit(worker, nxt_rec)
-                                            active_futures[nxt_fu] = nxt_rec
-                                if consecutive_transient >= MAX_CONSECUTIVE_TRANSIENT:
-                                    stop.set()
-                                    out.status = "stopped"
-                                    out.reason = (f"{MAX_CONSECUTIVE_TRANSIENT} consecutive transient "
-                                                  f"failures — API seems down: {payload}")
-                            elif kind == "abort":
-                                if out.status != "stopped":
-                                    out.status = "stopped"
-                                    out.reason = f"{type(payload).__name__}: {payload}"
-                        _progress(n_done, n_total, t0)
+                    for fu in as_completed(futures):
+                        fu.result()                # surfaces unexpected errors (e.g. checkpoint I/O)
                 except KeyboardInterrupt:
+                    interrupted = True
                     stop.set()
-                    out.status = "interrupted"
-                    out.reason = "KeyboardInterrupt"
                     executor.shutdown(wait=True, cancel_futures=True)
+                except BaseException:
+                    stop.set()
+                    executor.shutdown(wait=True, cancel_futures=True)
+                    raise
                 else:
                     executor.shutdown(wait=True)
                 sys.stderr.write("\n")
-        if stop.is_set() and out.status == "completed":
-            out.status = "interrupted"
-            out.reason = "stopped by user"
+
+        if state.status == "stopped":
+            out.status, out.reason = "stopped", state.reason
+        elif interrupted:
+            out.status, out.reason = "interrupted", "KeyboardInterrupt"
+        elif stop.is_set():
+            out.status, out.reason = "interrupted", "stopped by user"
+        out.n_new = state.written
     else:
         out.status = "nothing_to_do"
 
-    out.n_new = written
     out.results = load_checkpoint_deduped(checkpoint) if checkpoint.exists() else []
     done_now = {str(r.get("hash")) for r in out.results}
     out.n_remaining = sum(1 for r in records if str(r.get("hash", "")) not in done_now)

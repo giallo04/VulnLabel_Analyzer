@@ -6,8 +6,7 @@ Gemini API, and measures how accurate the original labels are.
 Pipeline
 --------
 1. Deterministic pre-filter (none / whitespace / comment / test) — no API call.
-2. LLM classification of the remaining records (one API call per function).
-   (--votes N for majority voting).
+2. LLM classification of the remaining records: exactly ONE API call per function.
 3. Incremental JSONL checkpoint, saved after each record; a re-run skips processed hashes.
 4. Outputs + statistics (see ``stats.py``):  results.csv, results_full.jsonl,
    accuracy_summary.json, stats_report.txt.
@@ -56,7 +55,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                      help="Disable the deterministic pre-filter and send all records to the API")
     sel.add_argument("--retry-errors", action="store_true",
                      help="On resume, re-query the records saved with parse_error=true "
-                          "(blocked / unparsable answers) instead of keeping them")
+                          "(blocked / unparsable answers). This is the only case in which a "
+                          "function gets a second API call.")
     sel.add_argument("--no-resume", action="store_true",
                      help="Do NOT skip hashes already in the checkpoint (re-process everything; "
                           "new lines are appended, the last line per hash wins)")
@@ -69,24 +69,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                      help="Client-side requests-per-minute cap. Set it to your account's limit "
                           "(AI Studio -> Rate limits); 0 = unlimited.")
     api.add_argument("--temperature", type=float, default=1,
-                     help="Sampling temperature (low = same input, same label)")
-    api.add_argument("--votes", type=int, default=1,
-                     help="Answers per function for a majority vote (odd numbers; 3 recommended "
-                          "for maximum precision, costs 3x calls). With >1 the temperature is "
-                          "raised to at least 0.7 so that the samples differ; a tie is recorded "
-                          "as UNDETERMINABLE")
-    api.add_argument("--vote-policy", choices=["adaptive", "always"], default="adaptive",
-                     help="adaptive: 1 sample per function, the other --votes-1 only when the "
-                          "answer contradicts the dataset label or is unusable (about 1.3x calls "
-                          "instead of 3x); always: every function gets all --votes samples")
+                     help="Sampling temperature. With a single answer per function there is no "
+                          "vote to absorb sampling noise: compare 1.0 and ~0.2 on a small "
+                          "hand-labelled sample before a full run")
     api.add_argument("--no-schema", action="store_true",
                      help="Do not send responseSchema (structured output); for models that do "
                           "not support it")
     api.add_argument("--seed", type=int, default=42, help="Seed for reproducibility")
     api.add_argument("--timeout", type=int, default=300, help="Per-request timeout in seconds")
     api.add_argument("--retries", type=int, default=6,
-                     help="Attempts for transient errors (5xx / network); exponential back-off "
-                          "with jitter (10s .. 120s) shared by all workers")
+                     help="Attempts for transient transport errors (5xx / network); exponential "
+                          "back-off with jitter (10s .. 120s) shared by all workers")
     api.add_argument("--max-output-tokens", type=int, default=32768,
                      help="Max output tokens (thinking tokens included)")
     api.add_argument("--thinking", choices=["minimal", "low", "medium", "high", "default"],
@@ -154,9 +147,6 @@ def main() -> int:
         thinking_level=None if args.thinking == "default" else args.thinking,
         structured_output=not args.no_schema,
     )
-    if args.votes < 1 or (args.votes > 1 and args.votes % 2 == 0):
-        print("warning: --votes should be an odd number (an even number can end in ties, "
-              "recorded as UNDETERMINABLE)", file=sys.stderr)
     out_dir = Path(args.out_dir)
 
     # --- load dataset ---
@@ -179,9 +169,7 @@ def main() -> int:
         checkpoint=out_dir / "checkpoint.jsonl",
         resume=not args.no_resume,
         skip_deterministic=args.skip_deterministic,
-        votes=max(1, args.votes),
         retry_errors=args.retry_errors,
-        vote_policy=args.vote_policy,
         use_callgraph=not args.no_callgraph,
     )
 

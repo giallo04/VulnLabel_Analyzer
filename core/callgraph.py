@@ -6,29 +6,42 @@ name-based* call graph built from their bodies (no repository access, no parser 
     comments and string/char literals are blanked  ->  every ``name(`` in the body is a call
     candidate  ->  kept only when ``name`` is another function of the same commit.
 
-The graph is used for two things:
+What the graph is used for
+--------------------------
+``CommitGraph.context_for`` describes how a function sits in the graph (callees, callers) and,
+for each neighbour, a *deterministic* summary of its own change (kind, +/- counts and the first
+changed lines). ``prompting`` renders it as the "Call graph" section.
 
-1. **Order.** Functions are analysed bottom-up: callees before callers (post-order of a DFS over
-   the strongly connected components; mutually recursive functions form one component and are
-   ordered by file/line). ``CommitGraph.order`` is that list.
-2. **Context.** When a function is analysed, ``CommitGraph.context_for`` describes how it sits in
-   the graph (callees, callers) together with the label already assigned to each related function
-   and a one-line reason. ``prompting`` renders it as ``<commit_callgraph>``.
+Labels given until that point
+-----------------------------
+``context_for(h, summaries, labels=verdicts)`` additionally attaches to every neighbour the label
+already issued for it (``verdicts``: hash -> verdict dict as returned by ``parse_llm_output`` /
+``precheck``, or a bare category string). A neighbour without a verdict is reported as pending.
+Passing ``labels=None`` reproduces the label-free context.
+
+This makes the analysis order meaningful: process a commit's functions in ``graph.order``
+(callees first) and store each verdict in ``verdicts`` before moving on. Commits stay independent
+of each other and can run in parallel; inside one commit the run is serial. Trade-offs to keep in
+mind: callers are mostly ``pending`` (they come after their callees), an early wrong label can
+propagate to its callers, and results depend on the order. ``cg_n_labelled`` is stored with every
+result so that runs with and without labels can be compared (ablation).
 """
 from __future__ import annotations
 
 import re
-from collections import Counter, defaultdict
+from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
-from .prompting import resolve_func_name
+from .prompting import analyze_record, resolve_func_name
 
-REASON_CHARS = 200           # length of the one-line explanation attached to a label
+MAX_NEIGHBOURS = 6        # callees / callers shown per side (the rest is only counted)
+EXCERPT_LINES = 3         # changed lines shown per neighbour
+EXCERPT_CHARS = 110       # characters per excerpt line
 
 
 # ---------------------------------------------------------------------------
-# Commit Key (Re-implemented locally after prompt.py simplification)
+# Commit Key
 # ---------------------------------------------------------------------------
 def commit_key(record: Dict[str, Any]) -> str:
     """Cache key for grouping functions by commit."""
@@ -74,35 +87,68 @@ def short_name(name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Reason shown next to an assigned label
+# Deterministic change summaries (what the prompt shows for a neighbour)
 # ---------------------------------------------------------------------------
-_RULE_RE = re.compile(r"^\W*Rule\s*([0-6])\b", re.IGNORECASE)
-_SENT_END_RE = re.compile(r"(?<=[.!?])\s")
+_HDR_RE = re.compile(r"^(?:\+\+\+|---) (?:a/|b/|/dev/null)")
 
 
-def _one_line(text: str) -> str:
-    return re.sub(r"\s+", " ", text or "").strip()
+def _excerpt(diff_text: str) -> List[str]:
+    """First few changed lines that are not comments or blanks, whitespace-collapsed."""
+    out: List[str] = []
+    for line in diff_text.splitlines():
+        if not line.startswith(("+", "-")) or _HDR_RE.match(line):
+            continue
+        content = line[1:].strip()
+        if not content or content.startswith(("//", "/*", "*")):
+            continue
+        out.append((line[0] + " " + re.sub(r"\s+", " ", content))[:EXCERPT_CHARS])
+        if len(out) >= EXCERPT_LINES:
+            break
+    return out
 
 
-def brief_reason(result: Dict[str, Any], limit: int = REASON_CHARS) -> str:
-    """Compact explanation of a label, built from fields already in the result."""
-    if result.get("method") == "deterministic":
-        rules = result.get("prefilter_rules") or []
-        if rules == ["diff_unrecoverable"]:
-            return "no diff could be attributed to this function"
-        return "deterministic pre-filter: " + (", ".join(map(str, rules)) or "rule-based")
-    parts: List[str] = []
-    m = _RULE_RE.match(_one_line(str(result.get("step_3_role") or "")))
-    if m:
-        parts.append(f"Rule {m.group(1)}")
-    change = _one_line(str(result.get("step_1_change") or ""))
-    if change:
-        first = _SENT_END_RE.split(change, 1)[0]
-        parts.append("change: " + first)
-    text = "; ".join(parts)
-    if len(text) > limit:
-        text = text[: limit - 3].rstrip() + "..."
-    return text
+def summarize_change(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Kind, +/- counts and a short excerpt of a record's own diff (no LLM involved)."""
+    try:
+        ctx = analyze_record(record)
+    except Exception:                      # a broken record must never break the neighbours
+        return {"kind": "unknown", "added": 0, "removed": 0, "excerpt": []}
+    kind = ctx["diff_kind"]
+    return {"kind": kind, "added": ctx["n_added"], "removed": ctx["n_removed"],
+            "excerpt": _excerpt(ctx["diff_text"]) if kind == "code" else []}
+
+
+class SummaryCache:
+    """Lazy hash -> change summary, so only neighbours that are actually shown get analysed."""
+
+    def __init__(self, records: Iterable[Dict[str, Any]]):
+        self._records = {str(r.get("hash")): r for r in records}
+        self._cache: Dict[str, Dict[str, Any]] = {}
+
+    def get(self, h: str, default: Any = None) -> Any:
+        s = self._cache.get(h)
+        if s is None:
+            rec = self._records.get(h)
+            if rec is None:
+                return default
+            s = self._cache[h] = summarize_change(rec)
+        return s
+
+
+# ---------------------------------------------------------------------------
+# Labels given so far
+# ---------------------------------------------------------------------------
+def compact_label(verdict: Any) -> Optional[Dict[str, Any]]:
+    """Reduce a stored verdict to what the prompt shows; None when there is no usable label.
+
+    Accepts the dict produced by ``parse_llm_output`` / ``precheck`` or a bare category string.
+    Failed parses (no category) count as "no label yet"."""
+    if isinstance(verdict, str):
+        return {"category": verdict, "rule": None, "flaw_visible": None, "source": None} if verdict else None
+    if not isinstance(verdict, dict) or verdict.get("parse_error") or not verdict.get("category"):
+        return None
+    return {"category": verdict["category"], "rule": verdict.get("rule"),
+            "flaw_visible": verdict.get("flaw_visible"), "source": verdict.get("source")}
 
 
 # ---------------------------------------------------------------------------
@@ -128,7 +174,7 @@ class CommitGraph:
     nodes: Dict[str, Node]
     callees: Dict[str, List[str]]          # hash -> callee hashes (graph order)
     callers: Dict[str, List[str]]          # hash -> caller hashes (graph order)
-    order: List[str]                       # analysis order: callees first
+    order: List[str]                       # callees first: THE processing order when labels are used
     pos: Dict[str, int]                    # hash -> index in `order`
     scc_of: Dict[str, int]                 # hash -> component id
     scc_members: Dict[int, List[str]]      # component id -> members (graph order)
@@ -145,34 +191,74 @@ class CommitGraph:
     def has_cycles(self) -> bool:
         return any(len(m) > 1 for m in self.scc_members.values())
 
-    def context_for(self, h: str, analyzed: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        """Plain-data description of function `h` in the graph (callees & callers only)."""
+    def levels(self) -> List[List[str]]:
+        """Bottom-up processing levels: level 0 = leaves (deepest in the call tree), then their
+        callers, and so on. Every callee sits in a strictly lower level than its caller, except
+        members of the same recursion cycle (same level, run those one after the other in list
+        order). Functions inside one level do not depend on each other, so a level can be
+        analysed in parallel; levels must be analysed in sequence."""
+        by_depth: Dict[int, List[str]] = defaultdict(list)
+        for h in self.order:
+            by_depth[self.depth[h]].append(h)
+        return [by_depth[d] for d in sorted(by_depth)]
+
+    def context_for(self, h: str, summaries: Any,
+                    labels: Optional[Mapping[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        """Plain-data description of function `h`: neighbours + their change summaries.
+
+        `summaries` is anything with ``.get(hash)`` (dict or SummaryCache).
+        `labels` maps hash -> verdict for the functions analysed so far; None disables labels,
+        an empty dict means "labels enabled, nothing analysed yet" (everything pending)."""
         if h not in self.nodes or len(self.nodes) < 2:
             return None
         me = self.nodes[h]
+        labels_given = labels is not None
+
+        def label_of(x: str) -> Optional[Dict[str, Any]]:
+            return compact_label(labels.get(x)) if labels_given else None
 
         def entry(x: str) -> Dict[str, Any]:
             n = self.nodes[x]
-            res = analyzed.get(x)
+            s = summaries.get(x) or {}
             return {"name": n.name, "file": n.file, "same_file": n.file == me.file,
-                    "label": res.get("category") if res else None,
-                    "reason": brief_reason(res) if res else ""}
+                    "kind": s.get("kind", "unknown"), "added": s.get("added", 0),
+                    "removed": s.get("removed", 0), "excerpt": s.get("excerpt", []),
+                    "label": label_of(x)}
 
+        def pick(ids: List[str]) -> Tuple[List[Dict[str, Any]], int]:
+            ents = [entry(x) for x in ids]
+            # most informative first: a neighbour already judged as the real fix, then same
+            # file, really changed, bigger change
+            ents.sort(key=lambda e: ((e["label"] or {}).get("category") != "CORRECT_LABEL",
+                                     not e["same_file"], e["kind"] != "code",
+                                     -(e["added"] + e["removed"]), e["name"]))
+            return ents[:MAX_NEIGHBOURS], max(0, len(ents) - MAX_NEIGHBOURS)
+
+        callees, more_callees = pick(self.callees[h])
+        callers, more_callers = pick(self.callers[h])
+        neighbours = set(self.callees[h]) | set(self.callers[h])
         return {
             "position": self.pos[h] + 1, "total": len(self.order), "depth": self.depth[h],
             "recursive": h in self.recursive,
-            "callees": [entry(x) for x in self.callees[h]],
-            "callers": [entry(x) for x in self.callers[h]],
+            "callees": callees, "callers": callers,
+            "n_callees": len(self.callees[h]), "n_callers": len(self.callers[h]),
+            "more_callees": more_callees, "more_callers": more_callers,
+            "labels_given": labels_given,
+            "n_neighbours": len(neighbours),
+            "n_labelled": sum(1 for x in neighbours if label_of(x)) if labels_given else 0,
         }
 
 
 def result_fields(graph_ctx: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """Traceability fields stored next to each result (aligned with minimized prompting)."""
+    """Traceability fields stored next to each result."""
     if not graph_ctx:
         return {"callgraph": False}
     return {"callgraph": True, "cg_position": graph_ctx["position"], "cg_total": graph_ctx["total"],
-            "cg_depth": graph_ctx["depth"], "cg_n_callees": len(graph_ctx["callees"]),
-            "cg_n_callers": len(graph_ctx["callers"])}
+            "cg_depth": graph_ctx["depth"],
+            "cg_n_callees": graph_ctx.get("n_callees", len(graph_ctx["callees"])),
+            "cg_n_callers": graph_ctx.get("n_callers", len(graph_ctx["callers"])),
+            "cg_labels_given": bool(graph_ctx.get("labels_given")),
+            "cg_n_labelled": graph_ctx.get("n_labelled", 0)}
 
 
 # ---------------------------------------------------------------------------
