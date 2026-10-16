@@ -50,9 +50,24 @@ from .prompting import (DEFAULT_CONFIG, PROMPT_VERSION, RESPONSE_JSON_SCHEMA, Pr
                         PromptConfig, analyze_record, parse_llm_output, precheck, prompt_meta)
 
 MAX_CONSECUTIVE_TRANSIENT = 8      # stop after this many back-to-back transient failures
+MAX_CONSECUTIVE_ERRORS = 5         # stop after this many back-to-back record-level exceptions
+                                   # (e.g. HTTP 400 on every request = request/config problem)
 ENRICH_SCHEMA_WITH_PAIR_DIFF = 3   # first enricher schema with reliable function-level diffs
 LLM_METHOD = "llm"
 RULE_METHOD = "rule"               # results of prompting.precheck (Rules 0 / 1 / comment-only)
+
+
+def _strip_unsupported(node: Any) -> Any:
+    """Gemini's `response_schema` is an OpenAPI subset: it rejects `additionalProperties`."""
+    if isinstance(node, dict):
+        return {k: _strip_unsupported(v) for k, v in node.items() if k != "additionalProperties"}
+    if isinstance(node, list):
+        return [_strip_unsupported(v) for v in node]
+    return node
+
+
+# Schema actually sent to the API (the prompt itself does not depend on it).
+LLM_RESPONSE_SCHEMA = _strip_unsupported(RESPONSE_JSON_SCHEMA)
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +157,7 @@ def process_record(record: Dict[str, Any], cfg: LLMConfig, *, builder: PromptBui
     meta = prompt_meta(record, ctx, graph_ctx, builder.cfg)
 
     reply = query_llm_ex(prompt.content, cfg, system=prompt.instructions,
-                         schema=RESPONSE_JSON_SCHEMA, temperature=cfg.temperature,
+                         schema=LLM_RESPONSE_SCHEMA, temperature=cfg.temperature,
                          seed=cfg.seed, max_output_tokens=cfg.max_output_tokens)
     verdict = parse_llm_output(reply.text)
     return _result(record, verdict, meta, method=LLM_METHOD, model=cfg.model_name,
@@ -231,6 +246,7 @@ class _RunState:
     written: int = 0
     done: int = 0
     consecutive_transient: int = 0
+    consecutive_errors: int = 0
     status: str = "completed"
     reason: str = ""
     t0: float = field(default_factory=time.time)
@@ -242,6 +258,22 @@ class _RunState:
             self.written += 1
             self.done += 1
             self.consecutive_transient = 0
+            self.consecutive_errors = 0
+            _progress(self.done, self.total, self.t0)
+
+    def error(self, ckpt: CheckpointWriter, result: Dict[str, Any], exc: Exception,
+              stop: threading.Event) -> None:
+        """Record-level exception: checkpointed as UNDETERMINABLE, but a streak stops the run."""
+        with self.lock:
+            ckpt.write(result)
+            self.written += 1
+            self.done += 1
+            self.consecutive_errors += 1
+            if self.consecutive_errors >= MAX_CONSECUTIVE_ERRORS and self.status != "stopped":
+                stop.set()
+                self.status = "stopped"
+                self.reason = (f"{MAX_CONSECUTIVE_ERRORS} consecutive record-level errors — "
+                               f"likely a request/config problem, not the data: {exc}")
             _progress(self.done, self.total, self.t0)
 
     def transient(self, rec: Dict[str, Any], exc: Exception, stop: threading.Event) -> None:
@@ -420,7 +452,8 @@ def run_pipeline(
                 continue
             except Exception as exc:  # record-level failure -> checkpointed as UNDETERMINABLE
                 _log(f"\n  [error] hash={r.get('hash')}: {exc}")
-                result = _error_record(r, exc, cfg.model_name, graph_ctx=graph_ctx)
+                state.error(ckpt, _error_record(r, exc, cfg.model_name, graph_ctx=graph_ctx), exc, stop)
+                continue
             state.record(ckpt, result)
             if labels is not None and not result.get("parse_error"):
                 labels[h] = _label_of(result)      # visible to the functions that follow
