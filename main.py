@@ -68,7 +68,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     api.add_argument("--rpm", type=float, default=10.0,
                      help="Client-side requests-per-minute cap. Set it to your account's limit "
                           "(AI Studio -> Rate limits); 0 = unlimited.")
-    api.add_argument("--temperature", type=float, default=1,
+    api.add_argument("--temperature", type=float, default=0.4,
                      help="Sampling temperature. With a single answer per function there is no "
                           "vote to absorb sampling noise: compare 1.0 and ~0.2 on a small "
                           "hand-labelled sample before a full run")
