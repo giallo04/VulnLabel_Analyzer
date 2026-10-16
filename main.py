@@ -6,9 +6,8 @@ Gemini API, and measures how accurate the original labels are.
 Pipeline
 --------
 1. Deterministic pre-filter (none / whitespace / comment / test) — no API call.
-2. LLM classification of the remaining records. Each commit is characterised ONCE (one extra
-   API call per commit, cached on disk) and that description is shared by all its functions;
-   then one API call per function (``--votes N`` for majority voting).
+2. LLM classification of the remaining records (one API call per function).
+   (--votes N for majority voting).
 3. Incremental JSONL checkpoint, saved after each record; a re-run skips processed hashes.
 4. Outputs + statistics (see ``stats.py``):  results.csv, results_full.jsonl,
    accuracy_summary.json, stats_report.txt.
@@ -28,7 +27,7 @@ from core.ingestion import load_enriched_dataset
 from core.llm_engine import LLMConfig
 from core.pipeline import run_pipeline
 
-DEFAULT_MODEL = "gemini-3.8-flash"
+DEFAULT_MODEL = "gemini-3.5-flash-lite"
 API_KEY_ENVS = ("GEMINI_API_KEY", "GOOGLE_API_KEY")
 
 
@@ -80,9 +79,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                      help="adaptive: 1 sample per function, the other --votes-1 only when the "
                           "answer contradicts the dataset label or is unusable (about 1.3x calls "
                           "instead of 3x); always: every function gets all --votes samples")
-    api.add_argument("--no-commit-verdict", action="store_true",
-                     help="Do NOT characterise each commit once and share it across its "
-                          "functions (ablation only: the commit is then not described at all)")
     api.add_argument("--no-schema", action="store_true",
                      help="Do not send responseSchema (structured output); for models that do "
                           "not support it")
@@ -103,8 +99,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     cg = ap.add_argument_group("call graph")
     cg.add_argument("--no-callgraph", action="store_true",
                     help="Do NOT build per-commit call graphs or inject call-graph context into prompts")
-    cg.add_argument("--hide-callgraph-labels", action="store_true",
-                    help="Include call-graph structure in prompts but hide labels of already-analyzed functions (ablation)")
     return ap
 
 
@@ -186,11 +180,9 @@ def main() -> int:
         resume=not args.no_resume,
         skip_deterministic=args.skip_deterministic,
         votes=max(1, args.votes),
-        use_commit_verdict=not args.no_commit_verdict,
         retry_errors=args.retry_errors,
         vote_policy=args.vote_policy,
         use_callgraph=not args.no_callgraph,
-        show_graph_labels=not args.hide_callgraph_labels,
     )
 
     # --- outputs + statistics (rebuilt from the whole checkpoint) ---

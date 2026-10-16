@@ -256,7 +256,10 @@ _DIFF_FILE_HDR_RE = re.compile(r"^(?:\+\+\+|---) (?:a/|b/|/dev/null)")
 _COMMENT_CONT_RE = re.compile(r"^\*+(?:\s|/|$)")
 _COSMETIC_KIND = {"blank": "whitespace_only", "comment": "comment_only"}
 
-
+def diff_available(record: Dict[str, Any]) -> bool:
+    """Check if a usable diff is available for this function."""
+    return _diff_info(record)["available"]
+    
 def _is_trivial_change(content: str) -> bool:
     s = content.strip()
     if not s or s.startswith("//"):
