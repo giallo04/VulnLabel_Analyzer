@@ -45,6 +45,8 @@ from typing import Any, Dict, List, Optional
 
 from .callgraph import SummaryCache, build_graphs, commit_key, result_fields, summarize_graphs
 from .checkpoint import CheckpointWriter, load_checkpoint_deduped
+from .deterministic import (DEFAULT_DETERMINISTIC_CONFIG, DeterministicConfig,
+                            deterministic_verdict)
 from .llm_engine import LLMAbort, LLMConfig, LLMTransientError, query_llm_ex
 from .prompting import (DEFAULT_CONFIG, PROMPT_VERSION, RESPONSE_JSON_SCHEMA, PromptBuilder,
                         PromptConfig, analyze_record, parse_llm_output, precheck, prompt_meta)
@@ -54,7 +56,7 @@ MAX_CONSECUTIVE_ERRORS = 5         # stop after this many back-to-back record-le
                                    # (e.g. HTTP 400 on every request = request/config problem)
 ENRICH_SCHEMA_WITH_PAIR_DIFF = 3   # first enricher schema with reliable function-level diffs
 LLM_METHOD = "llm"
-RULE_METHOD = "rule"               # results of prompting.precheck (Rules 0 / 1 / comment-only)
+RULE_METHOD = "deterministic"      # deterministic.py + prompting.precheck (same value as before)
 
 
 def _strip_unsupported(node: Any) -> Any:
@@ -127,6 +129,8 @@ def _result(record: Dict[str, Any], verdict: Dict[str, Any], meta: Dict[str, Any
         "parse_error": failed,
         "parse_error_reason": verdict.get("parse_error_reason", ""),
         "parse_method": verdict.get("parse_method"),
+        "prefilter_rules": verdict.get("prefilter_rules"),
+        "prefilter_confidence": verdict.get("prefilter_confidence"),
         "output_truncated": output_truncated,
         # single-answer self-consistency
         "rule": verdict.get("rule"),
@@ -322,6 +326,7 @@ def run_pipeline(
     retry_errors: bool = False,
     use_callgraph: bool = True,
     prompt_config: PromptConfig = DEFAULT_CONFIG,
+    deterministic_config: DeterministicConfig = DEFAULT_DETERMINISTIC_CONFIG,
 ) -> RunOutcome:
     """Classify `records` with `cfg`, appending every result to `checkpoint`."""
     out = RunOutcome(n_selected=len(records))
@@ -367,12 +372,21 @@ def run_pipeline(
         g = graphs.get(commit_key(r))
         return g.context_for(str(r.get("hash", "")), summaries) if g is not None else None
 
-    # --- rule-based pre-check (no API call) ---
+    # --- rule-based classification (no API call) ---
+    # 1) deterministic.py: test/doc paths, non-C files, verified cosmetic, linkage-only
+    # 2) diff without usable evidence -> UNDETERMINABLE (Rule 0)
+    # 3) prompting.precheck: no change / whitespace / comment-only (Rules 0 and 1)
     to_llm: List[Dict[str, Any]] = []
     rule_results: List[Dict[str, Any]] = []
-    n_rule = n_unattributed = n_legacy = 0
+    n_det = n_pre = n_unattributed = n_legacy = 0
     for r in todo:
         ctx = analyze_record(r, prompt_config)
+        if not skip_deterministic:
+            verdict = deterministic_verdict(r, deterministic_config)
+            if verdict is not None:
+                rule_results.append(_rule_result(r, verdict, ctx, plain_ctx(r), prompt_config))
+                n_det += 1
+                continue
         if ctx["diff_kind"] == "unavailable":
             # asking the model would only produce a guess
             if int(r.get("schema_version") or 1) >= ENRICH_SCHEMA_WITH_PAIR_DIFF:
@@ -385,12 +399,13 @@ def run_pipeline(
             verdict = precheck(r, ctx)
             if verdict is not None:
                 rule_results.append(_rule_result(r, verdict, ctx, plain_ctx(r), prompt_config))
-                n_rule += 1
+                n_pre += 1
                 continue
         to_llm.append(r)
 
     if not skip_deterministic:
-        _log(f"  → rule-based pre-check: {n_rule} classified, {len(to_llm)} sent to the API")
+        _log(f"  → deterministic pre-filter: {n_det} classified; diff pre-check: {n_pre} classified; "
+             f"{len(to_llm)} sent to the API")
     if n_unattributed:
         _log(f"  → {n_unattributed} records recorded as UNDETERMINABLE: no diff could be "
              f"attributed to the function (function pair not found, ambiguous or "
