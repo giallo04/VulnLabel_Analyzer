@@ -69,7 +69,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     api.add_argument("--rpm", type=float, default=10.0,
                      help="Client-side requests-per-minute cap. Set it to your account's limit "
                           "(AI Studio -> Rate limits); 0 = unlimited.")
-    api.add_argument("--temperature", type=float, default=0.2,
+    api.add_argument("--temperature", type=float, default=1,
                      help="Sampling temperature (low = same input, same label)")
     api.add_argument("--votes", type=int, default=1,
                      help="Answers per function for a majority vote (odd numbers; 3 recommended "

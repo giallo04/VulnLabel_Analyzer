@@ -3,16 +3,6 @@
 One category per function (-> predicted_target):
   CORRECT_LABEL (1) | WRONG_LABEL_SPREAD / _CONSISTENCY / _FEATURE / _IRRELEVANT (0) | UNDETERMINABLE (-1)
 
-Design principles (for reproducibility):
-  * zero-shot: no worked examples, no calibration cases;
-  * neutral: no base-rate statements, no strictness regimes, no outcome-steering heuristics,
-    no deterministic priors (churn rank, name-in-message, sibling lists) shown to the model;
-  * role prompting + step-by-step reasoning fields that precede the label (chain-of-thought);
-  * the dataset label is never shown; each call is stateless;
-  * the diff is scoped to THIS function; evidence rules concern validity only;
-  * the commit-level verdict (nature, root cause, fix pattern, scope) is computed ONCE per
-    commit, cached, and injected as data into every function of that commit: the commit is
-    therefore described identically for all its functions (the model never re-describes it).
 """
 from __future__ import annotations
 
