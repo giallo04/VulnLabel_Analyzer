@@ -47,6 +47,7 @@ from .callgraph import SummaryCache, build_graphs, commit_key, result_fields, su
 from .checkpoint import CheckpointWriter, load_checkpoint_deduped
 from .deterministic import (DEFAULT_DETERMINISTIC_CONFIG, DeterministicConfig,
                             deterministic_verdict)
+from .diffclean import trim_span_artifacts
 from .llm_engine import LLMAbort, LLMConfig, LLMTransientError, query_llm_ex
 from .prompting import (DEFAULT_CONFIG, PROMPT_VERSION, RESPONSE_JSON_SCHEMA, PromptBuilder,
                         PromptConfig, analyze_record, parse_llm_output, precheck, prompt_meta)
@@ -131,6 +132,7 @@ def _result(record: Dict[str, Any], verdict: Dict[str, Any], meta: Dict[str, Any
         "parse_method": verdict.get("parse_method"),
         "prefilter_rules": verdict.get("prefilter_rules"),
         "prefilter_confidence": verdict.get("prefilter_confidence"),
+        "diff_lines_trimmed": change.get("span_trimmed", 0),   # out-of-span lines removed (diffclean)
         "output_truncated": output_truncated,
         # single-answer self-consistency
         "rule": verdict.get("rule"),
@@ -332,6 +334,17 @@ def run_pipeline(
     out = RunOutcome(n_selected=len(records))
     stop = stop or threading.Event()
     builder = PromptBuilder(prompt_config)
+
+    # --- drop diff lines outside the labelled function span (return-type / export-macro lines) ---
+    # Done on `records` itself so that prompts, neighbour excerpts and the rule checks all see it.
+    trimmed = [trim_span_artifacts(r) for r in records]
+    records = [r for r, _ in trimmed]
+    n_trimmed = sum(1 for _, k in trimmed if k)
+    if n_trimmed:
+        _log(f"  → diff cleanup: {n_trimmed} records had diff lines outside the function span "
+             f"(return type / export macro on the line before the name) removed "
+             f"({sum(k for _, k in trimmed)} lines)")
+    del trimmed
 
     # --- resume: skip what is already in the checkpoint, keep its verdicts as neighbour labels ---
     already_done: set[str] = set()
