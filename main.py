@@ -99,6 +99,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                           "default; use it for models without thinking levels, e.g. Gemma)")
     api.add_argument("--base-url", default="https://generativelanguage.googleapis.com",
                      help="API base URL (change only for proxies / tests)")
+
+    cg = ap.add_argument_group("call graph")
+    cg.add_argument("--no-callgraph", action="store_true",
+                    help="Do NOT build per-commit call graphs or inject call-graph context into prompts")
+    cg.add_argument("--hide-callgraph-labels", action="store_true",
+                    help="Include call-graph structure in prompts but hide labels of already-analyzed functions (ablation)")
     return ap
 
 
@@ -183,6 +189,8 @@ def main() -> int:
         use_commit_verdict=not args.no_commit_verdict,
         retry_errors=args.retry_errors,
         vote_policy=args.vote_policy,
+        use_callgraph=not args.no_callgraph,
+        show_graph_labels=not args.hide_callgraph_labels,
     )
 
     # --- outputs + statistics (rebuilt from the whole checkpoint) ---

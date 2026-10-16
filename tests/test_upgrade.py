@@ -104,7 +104,8 @@ class TestSiblingContext(unittest.TestCase):
         self.assertNotIn("</task>f", u)
 
     def test_prompt_version_bumped(self):
-        self.assertIn("v11", PROMPT_VERSION)
+        self.assertIn("v12", PROMPT_VERSION)
+        self.assertIn("callgraph", PROMPT_VERSION)
 
 
 if __name__ == "__main__":

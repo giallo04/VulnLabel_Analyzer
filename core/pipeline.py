@@ -23,14 +23,17 @@ unchanged into the prompt of every function of that commit. Optional self-consis
 """
 from __future__ import annotations
 
+import concurrent.futures
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import defaultdict
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
+from .callgraph import CommitGraph, build_graphs, result_fields, summarize_graphs
 from .checkpoint import CheckpointWriter, load_checkpoint_deduped
 from .commit_verdict import CommitVerdicts
 from .deterministic import deterministic_classify, undeterminable_no_diff
@@ -141,17 +144,26 @@ def _needs_escalation(sample: Dict[str, Any], original_target: int) -> bool:
 def process_record(record: Dict[str, Any], cfg: LLMConfig, *,
                    verdicts: Optional[CommitVerdicts] = None,
                    ctx: Optional[Dict[str, Any]] = None, votes: int = 1,
-                   vote_policy: str = "always") -> Dict[str, Any]:
+                   vote_policy: str = "always",
+                   graph_ctx: Optional[Dict[str, Any]] = None,
+                   graphs: Optional[Dict[str, CommitGraph]] = None,
+                   analyzed: Optional[Dict[str, Dict[str, Any]]] = None,
+                   show_graph_labels: bool = True) -> Dict[str, Any]:
     """Full LLM cycle for a single record. Returns a result dict.
 
     The commit verdict (when `verdicts` is given) is shared by all the functions of the commit.
     """
+    if graph_ctx is None and graphs is not None and analyzed is not None:
+        g = graphs.get(commit_key(record))
+        if g is not None:
+            graph_ctx = g.context_for(str(record.get("hash", "")), analyzed, show_labels=show_graph_labels)
+
     verdict = verdicts.get(record, ctx) if verdicts is not None else None
     # Pre-compute the diff analysis ONCE and share between build_messages and prompt_meta,
     # eliminating the double parse of the diff string that was happening before.
     diff_ctx = analyze_record(record)
-    msgs = build_messages(record, verdict, ctx=diff_ctx)   # stateless: pure function of record + verdict
-    meta = prompt_meta(record, verdict, ctx=diff_ctx)
+    msgs = build_messages(record, verdict, ctx=diff_ctx, graph_ctx=graph_ctx)   # stateless: pure function of record + verdict
+    meta = prompt_meta(record, verdict, ctx=diff_ctx, graph_ctx=graph_ctx)
 
     votes = max(1, int(votes))
     temperature = cfg.temperature if votes == 1 else max(cfg.temperature, VOTE_MIN_TEMPERATURE)
@@ -198,6 +210,8 @@ def process_record(record: Dict[str, Any], cfg: LLMConfig, *,
         "commit_fix_pattern": meta["commit_fix_pattern"],
         "commit_fix_scope": meta["commit_fix_scope"],
         "commit_verdict_fallback": bool((verdict or {}).get("fallback", False)),
+        # call graph context & traceability
+        **result_fields(graph_ctx),
         # full reasoning
         "step_1_change": parsed.get("step_1_change", ""),
         "step_2_flaw":   parsed.get("step_2_flaw", ""),
@@ -222,11 +236,11 @@ def process_record(record: Dict[str, Any], cfg: LLMConfig, *,
         "name_in_message":       signals.get("name_in_message"),
         "cwe_matches_nvd":       signals.get("cwe_matches_nvd"),
         "cwe_missing":           signals.get("cwe_missing_in_dataset", False),
-
     }
 
 
-def _error_record(rec: Dict[str, Any], exc: Exception, model: str) -> Dict[str, Any]:
+def _error_record(rec: Dict[str, Any], exc: Exception, model: str,
+                  graph_ctx: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Minimal record so that a record-level failure is checkpointed."""
     return {
         "hash": rec.get("hash"),
@@ -243,6 +257,7 @@ def _error_record(rec: Dict[str, Any], exc: Exception, model: str) -> Dict[str, 
         "parse_error": True,
         "parse_error_reason": str(exc),
         "raw_output": None,
+        **result_fields(graph_ctx),
     }
 
 
@@ -321,6 +336,8 @@ def run_pipeline(
     use_commit_verdict: bool = True,
     retry_errors: bool = False,
     vote_policy: str = "adaptive",
+    use_callgraph: bool = True,
+    show_graph_labels: bool = True,
 ) -> RunOutcome:
     """Classify `records` with `cfg`, appending every result to `checkpoint`."""
     out = RunOutcome(n_selected=len(records))
@@ -328,6 +345,7 @@ def run_pipeline(
 
     # --- resume: skip what is already in the checkpoint ---
     already_done: set[str] = set()
+    previous: List[Dict[str, Any]] = []
     if resume and checkpoint.exists():
         previous = load_checkpoint_deduped(checkpoint)
         retry = [r for r in previous if retry_errors and r.get("parse_error")]
@@ -349,6 +367,18 @@ def run_pipeline(
     todo = [r for r in records if str(r.get("hash", "")) not in already_done]
     out.n_resumed = len(records) - len(todo)
     _log(f"  → {len(todo)} records remaining ({out.n_resumed} already done)")
+
+    # --- call graph: one CommitGraph per commit ---
+    graphs = build_graphs(records) if use_callgraph else {}
+    if use_callgraph and graphs:
+        _log(f"  → call graph: {summarize_graphs(graphs)}")
+
+    analyzed: Dict[str, Dict[str, Any]] = {}
+    if previous:
+        for r in previous:
+            h = str(r.get("hash", ""))
+            if h and (not retry_errors or not r.get("parse_error")):
+                analyzed[h] = r
 
     # --- deterministic pre-filter (no API call) ---
     to_llm: List[Dict[str, Any]] = []
@@ -388,6 +418,47 @@ def run_pipeline(
                  f"attributed to the function (enriched with an old schema). Re-run "
                  f"`python -m dv_enricher ... --refresh`, then run again.")
 
+    # Attach call graph context to deterministic results and register in analyzed
+    for det in determ_results:
+        h = str(det.get("hash", ""))
+        ck = commit_key(det)
+        g = graphs.get(ck)
+        cg = g.context_for(h, analyzed, show_labels=show_graph_labels) if (g and use_callgraph) else None
+        det.update(result_fields(cg))
+        if h:
+            analyzed[h] = det
+
+    # Order to_llm so that within each commit, records follow g.order (callees first)
+    if use_callgraph:
+        to_llm.sort(key=lambda r: (
+            commit_key(r),
+            graphs[commit_key(r)].pos.get(str(r.get("hash", "")), 0) if commit_key(r) in graphs else 0
+        ))
+
+    # Dependency tracking for bottom-up analysis within each commit
+    deps: Dict[str, Set[str]] = {}
+    to_llm_hashes = {str(r.get("hash", "")) for r in to_llm}
+    rec_by_hash = {str(r.get("hash", "")): r for r in to_llm}
+
+    for r in to_llm:
+        h = str(r.get("hash", ""))
+        ck = commit_key(r)
+        g = graphs.get(ck)
+        if use_callgraph and g is not None and h in g.pos:
+            pos = g.pos[h]
+            commit_deps = {pred_h for pred_h in g.order[:pos] if pred_h in to_llm_hashes}
+            deps[h] = commit_deps
+        else:
+            deps[h] = set()
+
+    remaining_deps = {h: set(d) for h, d in deps.items()}
+    dependents: Dict[str, List[str]] = defaultdict(list)
+    for h, ds in deps.items():
+        for d in ds:
+            dependents[d].append(h)
+
+    ready = [r for r in to_llm if not remaining_deps[str(r.get("hash", ""))]]
+
     # commit context + shared commit verdicts (one API call per commit)
     ctx_by_commit: Dict[str, Dict[str, Any]] = {}
     for r in records:
@@ -410,14 +481,24 @@ def run_pipeline(
         consecutive_transient = 0
         n_done = 0
         n_total = len(to_llm)
+        state_lock = threading.Lock()
 
         def worker(r: Dict[str, Any]):
             if stop.is_set():
                 return "skipped", r, None
+            h = str(r.get("hash", ""))
+            ck = commit_key(r)
+            g = graphs.get(ck) if graphs else None
+            graph_ctx = None
+            if g is not None and use_callgraph:
+                with state_lock:
+                    snap = dict(analyzed)
+                graph_ctx = g.context_for(h, snap, show_labels=show_graph_labels)
             try:
-                return "ok", r, process_record(
-                    r, cfg, verdicts=verdicts, ctx=ctx_by_commit.get(commit_key(r)), votes=votes,
-                    vote_policy=vote_policy)
+                payload = process_record(
+                    r, cfg, verdicts=verdicts, ctx=ctx_by_commit.get(ck), votes=votes,
+                    vote_policy=vote_policy, graph_ctx=graph_ctx)
+                return "ok", r, payload
             except LLMAbort as exc:
                 stop.set()
                 return "abort", r, exc
@@ -425,7 +506,7 @@ def run_pipeline(
                 return "transient", r, exc
             except Exception as exc:  # record-level failure -> checkpointed as UNDETERMINABLE
                 _log(f"\n  [error] hash={r.get('hash')}: {exc}")
-                return "error", r, _error_record(r, exc, cfg.model_name)
+                return "error", r, _error_record(r, exc, cfg.model_name, graph_ctx=graph_ctx)
 
         with CheckpointWriter(checkpoint) as ckpt:
             for det in determ_results:
@@ -434,31 +515,54 @@ def run_pipeline(
 
             if to_llm:
                 executor = ThreadPoolExecutor(max_workers=max(1, workers))
+                active_futures: Dict[Any, Dict[str, Any]] = {}
                 try:
-                    futs = [executor.submit(worker, r) for r in to_llm]
-                    for fu in as_completed(futs):
-                        kind, rec, payload = fu.result()
-                        if kind == "skipped":
-                            continue
-                        n_done += 1
-                        if kind in ("ok", "error"):
-                            consecutive_transient = 0
-                            ckpt.write(payload)
-                            written += 1
-                        elif kind == "transient":
-                            consecutive_transient += 1
-                            _log(f"\n  [transient] hash={rec.get('hash')} NOT checkpointed "
-                                 f"(will be retried on resume): {payload}")
-                            if consecutive_transient >= MAX_CONSECUTIVE_TRANSIENT:
-                                stop.set()
-                                out.status = "stopped"
-                                out.reason = (f"{MAX_CONSECUTIVE_TRANSIENT} consecutive transient "
-                                              f"failures — API seems down: {payload}")
-                        elif kind == "abort":
-                            if out.status != "stopped":
-                                out.status = "stopped"
-                                out.reason = f"{type(payload).__name__}: {payload}"
-                        _progress(n_done, n_total, t0)
+                    for r in ready:
+                        fu = executor.submit(worker, r)
+                        active_futures[fu] = r
+
+                    while active_futures:
+                        done, _ = wait(active_futures.keys(), return_when=FIRST_COMPLETED)
+                        for fu in done:
+                            rec = active_futures.pop(fu)
+                            kind, _, payload = fu.result()
+                            if kind == "skipped":
+                                continue
+                            n_done += 1
+                            h = str(rec.get("hash", ""))
+                            if kind in ("ok", "error"):
+                                consecutive_transient = 0
+                                ckpt.write(payload)
+                                written += 1
+                                with state_lock:
+                                    analyzed[h] = payload
+                                    for dep_h in dependents.get(h, []):
+                                        remaining_deps[dep_h].discard(h)
+                                        if not remaining_deps[dep_h] and not stop.is_set():
+                                            nxt_rec = rec_by_hash[dep_h]
+                                            nxt_fu = executor.submit(worker, nxt_rec)
+                                            active_futures[nxt_fu] = nxt_rec
+                            elif kind == "transient":
+                                consecutive_transient += 1
+                                _log(f"\n  [transient] hash={rec.get('hash')} NOT checkpointed "
+                                     f"(will be retried on resume): {payload}")
+                                with state_lock:
+                                    for dep_h in dependents.get(h, []):
+                                        remaining_deps[dep_h].discard(h)
+                                        if not remaining_deps[dep_h] and not stop.is_set():
+                                            nxt_rec = rec_by_hash[dep_h]
+                                            nxt_fu = executor.submit(worker, nxt_rec)
+                                            active_futures[nxt_fu] = nxt_rec
+                                if consecutive_transient >= MAX_CONSECUTIVE_TRANSIENT:
+                                    stop.set()
+                                    out.status = "stopped"
+                                    out.reason = (f"{MAX_CONSECUTIVE_TRANSIENT} consecutive transient "
+                                                  f"failures — API seems down: {payload}")
+                            elif kind == "abort":
+                                if out.status != "stopped":
+                                    out.status = "stopped"
+                                    out.reason = f"{type(payload).__name__}: {payload}"
+                            _progress(n_done, n_total, t0)
                 except KeyboardInterrupt:
                     stop.set()
                     out.status = "interrupted"
