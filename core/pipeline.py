@@ -125,9 +125,23 @@ def _combine(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
             "all_parse_errors": False}
 
 
+def _needs_escalation(sample: Dict[str, Any], original_target: int) -> bool:
+    """Adaptive voting: is one sample enough, or must the remaining votes be drawn?
+
+    Escalate when the single answer is unusable (parse error / UNDETERMINABLE) or when it
+    CONTRADICTS the dataset label (a suspected noise record: the only verdict that changes the
+    final statistics, so the only one worth paying extra votes for). An answer that confirms
+    the original label is kept as is.
+    """
+    if sample["parse_error"] or sample["category"] == "UNDETERMINABLE":
+        return True
+    return sample["predicted_target"] != original_target
+
+
 def process_record(record: Dict[str, Any], cfg: LLMConfig, *,
                    verdicts: Optional[CommitVerdicts] = None,
-                   ctx: Optional[Dict[str, Any]] = None, votes: int = 1) -> Dict[str, Any]:
+                   ctx: Optional[Dict[str, Any]] = None, votes: int = 1,
+                   vote_policy: str = "always") -> Dict[str, Any]:
     """Full LLM cycle for a single record. Returns a result dict.
 
     The commit verdict (when `verdicts` is given) is shared by all the functions of the commit.
@@ -141,11 +155,15 @@ def process_record(record: Dict[str, Any], cfg: LLMConfig, *,
 
     votes = max(1, int(votes))
     temperature = cfg.temperature if votes == 1 else max(cfg.temperature, VOTE_MIN_TEMPERATURE)
-    samples = [_ask_once(msgs, cfg, seed=cfg.seed + 101 * i, temperature=temperature)
-               for i in range(votes)]
+    original_target = int(record.get("target", -1))
+    samples = [_ask_once(msgs, cfg, seed=cfg.seed + 101 * 0, temperature=temperature)]
+    # vote_policy='adaptive': the extra votes are bought only for suspected noise / unusable
+    # answers; 'always' (legacy) draws all `votes` samples for every record.
+    if votes > 1 and (vote_policy == "always" or _needs_escalation(samples[0], original_target)):
+        samples += [_ask_once(msgs, cfg, seed=cfg.seed + 101 * i, temperature=temperature)
+                    for i in range(1, votes)]
     parsed = _combine(samples)
 
-    original_target = int(record.get("target", -1))
     predicted_target = parsed["predicted_target"]
 
     change = record.get("change") or {}
@@ -244,6 +262,49 @@ def _log(msg: str) -> None:
     print(msg, file=sys.stderr)
 
 
+def estimate_calls(n_records: int, n_commits: int, n_verdicts_cached: int, votes: int,
+                   vote_policy: str, noise_rate: float = 0.35) -> Dict[str, float]:
+    """Expected number of API calls (min / expected / max) for a run.
+
+    `noise_rate` is the assumed share of records the model contradicts (escalated to the full
+    vote under the adaptive policy); only used for the 'expected' figure.
+    """
+    commit_calls = max(0, n_commits - n_verdicts_cached)
+    lo = n_records + commit_calls
+    hi = n_records * max(1, votes) + commit_calls
+    if votes <= 1:
+        exp = hi
+    elif vote_policy == "always":
+        exp = hi
+    else:
+        exp = n_records * (1 + noise_rate * (votes - 1)) + commit_calls
+    return {"min": lo, "expected": exp, "max": hi}
+
+
+def _fmt_hours(h: float) -> str:
+    return f"{h * 60:.0f} min" if h < 1 else f"{h:.1f} h"
+
+
+def _log_estimate(n_records: int, n_commits: int, n_cached: int, votes: int, vote_policy: str,
+                  cfg: LLMConfig) -> None:
+    """Tell the user up front what the chosen flags cost (the rpm floor is a hard bound)."""
+    if n_records <= 0:
+        return
+    est = estimate_calls(n_records, n_commits, n_cached, votes, vote_policy)
+    if cfg.rpm and cfg.rpm > 0:
+        floor = {k: v / cfg.rpm / 60 for k, v in est.items()}
+        _log(f"  → estimate: ~{est['expected']:.0f} API calls ({est['min']:.0f}-{est['max']:.0f}); "
+             f"at rpm={cfg.rpm:g} that is >= {_fmt_hours(floor['expected'])} "
+             f"(best case {_fmt_hours(floor['min'])}, worst {_fmt_hours(floor['max'])}) "
+             f"before any retry")
+        if floor["expected"] > 12:
+            _log("  ⚠ the rpm cap, not the workers, bounds the run: check your real quota "
+                 "(AI Studio -> Rate limits), use --votes 1 / --vote-policy adaptive, lower "
+                 "--thinking for a first pass, or split the run")
+    else:
+        _log(f"  → estimate: ~{est['expected']:.0f} API calls ({est['min']:.0f}-{est['max']:.0f})")
+
+
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
@@ -259,6 +320,7 @@ def run_pipeline(
     votes: int = 1,
     use_commit_verdict: bool = True,
     retry_errors: bool = False,
+    vote_policy: str = "adaptive",
 ) -> RunOutcome:
     """Classify `records` with `cfg`, appending every result to `checkpoint`."""
     out = RunOutcome(n_selected=len(records))
@@ -339,6 +401,9 @@ def run_pipeline(
     if verdicts is not None and verdicts.n_loaded:
         _log(f"  → {verdicts.n_loaded} commit verdicts reused from commit_verdicts.jsonl")
 
+    _log_estimate(len(to_llm), len({commit_key(r) for r in to_llm}) if use_commit_verdict else 0,
+                  verdicts.n_loaded if verdicts is not None else 0, votes, vote_policy, cfg)
+
     written = 0
     if todo:
         t0 = time.time()
@@ -351,7 +416,8 @@ def run_pipeline(
                 return "skipped", r, None
             try:
                 return "ok", r, process_record(
-                    r, cfg, verdicts=verdicts, ctx=ctx_by_commit.get(commit_key(r)), votes=votes)
+                    r, cfg, verdicts=verdicts, ctx=ctx_by_commit.get(commit_key(r)), votes=votes,
+                    vote_policy=vote_policy)
             except LLMAbort as exc:
                 stop.set()
                 return "abort", r, exc

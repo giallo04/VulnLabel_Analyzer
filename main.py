@@ -76,6 +76,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                           "for maximum precision, costs 3x calls). With >1 the temperature is "
                           "raised to at least 0.7 so that the samples differ; a tie is recorded "
                           "as UNDETERMINABLE")
+    api.add_argument("--vote-policy", choices=["adaptive", "always"], default="adaptive",
+                     help="adaptive: 1 sample per function, the other --votes-1 only when the "
+                          "answer contradicts the dataset label or is unusable (about 1.3x calls "
+                          "instead of 3x); always: every function gets all --votes samples")
     api.add_argument("--no-commit-verdict", action="store_true",
                      help="Do NOT characterise each commit once and share it across its "
                           "functions (ablation only: the commit is then not described at all)")
@@ -84,8 +88,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                           "not support it")
     api.add_argument("--seed", type=int, default=42, help="Seed for reproducibility")
     api.add_argument("--timeout", type=int, default=300, help="Per-request timeout in seconds")
-    api.add_argument("--retries", type=int, default=5,
-                     help="Attempts for transient errors (5xx / network), exponential back-off")
+    api.add_argument("--retries", type=int, default=6,
+                     help="Attempts for transient errors (5xx / network); exponential back-off "
+                          "with jitter (10s .. 120s) shared by all workers")
     api.add_argument("--max-output-tokens", type=int, default=32768,
                      help="Max output tokens (thinking tokens included)")
     api.add_argument("--thinking", choices=["minimal", "low", "medium", "high", "default"],
@@ -177,6 +182,7 @@ def main() -> int:
         votes=max(1, args.votes),
         use_commit_verdict=not args.no_commit_verdict,
         retry_errors=args.retry_errors,
+        vote_policy=args.vote_policy,
     )
 
     # --- outputs + statistics (rebuilt from the whole checkpoint) ---

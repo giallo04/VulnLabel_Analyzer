@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import random
 import re
 import sys
 import threading
@@ -71,8 +72,11 @@ class LLMConfig:
     seed: int = 42
     max_output_tokens: int = 32768      # thinking tokens included (high thinking can use a lot)
     timeout: float = 300                # seconds per request
-    retries: int = 5                    # attempts on transient errors (5xx / network)
-    backoff_base: float = 2.0           # exponential back-off base (seconds)
+    retries: int = 6                    # attempts on transient errors (5xx / network)
+    backoff_base: float = 2.0           # exponential factor of the back-off (attempt k waits ~initial*base^(k-1))
+    backoff_initial: float = 10.0       # first wait on 5xx/overload (seconds): an overloaded model needs time
+    backoff_max: float = 120.0          # cap of a single back-off wait (seconds)
+    backoff_jitter: float = 0.25        # +-25% random spread so the workers do not retry in lockstep
     rpm: float = 10.0                   # client-side requests-per-minute cap (0 = unlimited)
     # "minimal" | "low" | "medium" | "high"; None = model default.  Default "high": the labelling
     # task needs real deliberation (the answer fields are the final analysis, not a scratchpad).
@@ -144,6 +148,14 @@ class RateLimiter:
         wait = slot - now
         if wait > 0:
             time.sleep(wait)
+
+    def refund(self) -> None:
+        """Give back one slot: a request the server rejected for overload (5xx) did not consume
+        the per-minute budget, so the retry must not wait for a second slot."""
+        if self.interval <= 0:
+            return
+        with self._lock:
+            self._next = max(time.monotonic(), self._next - self.interval)
 
     def penalize(self, seconds: float) -> None:
         """Push the next free slot forward (server told us to back off)."""
@@ -304,6 +316,17 @@ def _is_auth_problem(code: int, message: str, err: Dict[str, Any]) -> bool:
     return False
 
 
+def backoff_delay(cfg: LLMConfig, attempt: int, server_hint: Optional[float] = None) -> float:
+    """Wait before retry number `attempt` (1-based): exponential from ``backoff_initial``, capped
+    at ``backoff_max``, with +-jitter; a server ``Retry-After`` hint is a lower bound."""
+    base = min(cfg.backoff_max, cfg.backoff_initial * (cfg.backoff_base ** (attempt - 1)))
+    wait = base * (1.0 + random.uniform(-cfg.backoff_jitter, cfg.backoff_jitter))
+    if server_hint:
+        wait = max(wait, server_hint)
+    cap = max(cfg.backoff_max, server_hint) if server_hint else cfg.backoff_max
+    return max(0.0, min(wait, cap))
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -331,6 +354,7 @@ def query_llm_ex(prompt: str, cfg: LLMConfig, *, system: Optional[str] = None,
     limiter = _get_limiter(cfg)
 
     attempts = 0          # transient failures consumed
+    server_hint: Optional[float] = None   # Retry-After / retryDelay of the last 5xx
     rate_waits = 0        # per-minute 429 waits consumed
     last_exc: Exception | None = None
 
@@ -390,6 +414,8 @@ def query_llm_ex(prompt: str, cfg: LLMConfig, *, system: Optional[str] = None,
                 ) from exc
             if code in (408, 500, 502, 503, 504):
                 last_exc = RuntimeError(f"HTTP {code}: {message}")
+                server_hint = _retry_delay(err, exc.headers)
+                limiter.refund()          # overload errors must not eat the rpm budget
             else:
                 # e.g. 400 INVALID_ARGUMENT for this specific prompt: record-level failure
                 raise RuntimeError(f"Gemini rejected the request (HTTP {code}): {message}") from exc
@@ -405,10 +431,16 @@ def query_llm_ex(prompt: str, cfg: LLMConfig, *, system: Optional[str] = None,
                 f"Gemini unavailable after {cfg.retries} attempts "
                 f"(model={cfg.model_name}): {last_exc}"
             ) from last_exc
-        wait = cfg.backoff_base ** attempts
+        wait = backoff_delay(cfg, attempts, server_hint)
+        server_hint = None
         print(
-            f"  [gemini] attempt {attempts}/{cfg.retries} failed: {last_exc}. "
+            f"  [gemini] attempt {attempts}/{cfg.retries} failed: {str(last_exc)[:120]}. "
             f"Retrying in {wait:.0f}s…",
             file=sys.stderr,
         )
-        time.sleep(wait)
+        # All workers back off together (an overloaded endpoint is not helped by 4 threads
+        # retrying in parallel); with rpm=0 there is no limiter slot to push, so sleep here.
+        if limiter.interval > 0:
+            limiter.penalize(wait)
+        else:
+            time.sleep(wait)

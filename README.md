@@ -48,7 +48,7 @@ python -m dv_enricher --dataset diversevul_20230702.zip --out enriched.jsonl --w
 ### 2. Classificazione
 
 ```bash
-python main.py --dataset enriched.jsonl --model gemini-3.8-flash --workers 4 --rpm 60
+python main.py --dataset enriched.jsonl --model gemini-3.8-flash --workers 4 --rpm 27
 ```
 
 Il **thinking è `high` di default** (`--thinking minimal|low|medium|high|default`). `default` non invia `thinkingConfig`: serve per modelli senza livelli di thinking (es. Gemma); se il modello rifiuta il thinking l'errore è fatale e chiaro, non una riga rovinata per ogni record. Il thinking consuma token di output, per questo `--max-output-tokens` è salito a 32768. Per il free tier (≈500 richieste/giorno) usa un modello Flash-Lite, ad es. `--model gemini-3.5-flash-lite --rpm 15`; verifica i limiti nella pagina Rate limit di AI Studio.
@@ -62,6 +62,13 @@ Il **thinking è `high` di default** (`--thinking minimal|low|medium|high|defaul
 - Il run si ferma da solo alla prima quota giornaliera esaurita o dopo 8 errori transitori consecutivi.
 - Se il checkpoint contiene risultati di un altro modello, viene mostrato un avviso: quei record **non** vengono rielaborati. Per valutare un nuovo modello da solo usa un `--out-dir` diverso.
 - A fine run vengono scritti `results.csv`, `results_full.jsonl` (con `raw_output`), `accuracy_summary.json` e `stats_report.txt`.
+
+**Velocità e carico sull'API (v11).**
+
+- **Stima iniziale.** Prima del run il log mostra chiamate attese (min–max) e il tempo minimo imposto da `--rpm`. È il tetto rpm, non i `--workers`, a fissare la durata: con `--rpm 5 --votes 3` e 4 476 record il minimo è ~45 h, con `--vote-policy adaptive` scende a ~25 h, con `--votes 1` a ~15 h.
+- **Voto adattivo (default).** Un verdetto che *conferma* la label originale vale 1 chiamata; solo i sospetti rumore (e i verdetti non parsabili/`UNDETERMINABLE`) ricevono gli altri voti. I record con `n_votes=1` sono quelli confermati al primo campione. `--vote-policy always` ripristina il comportamento precedente.
+- **Back-off per 5xx/503.** Attese esponenziali con jitter (10 s, 20 s, 40 s … max 120 s, rispettando `Retry-After`), condivise da tutti i worker (nessun retry in parallelo contro un modello sovraccarico), e gli errori 5xx *non* consumano il budget rpm.
+- **Contesto dai commit.** Il prompt include `<commit_siblings>` (altre funzioni/frammenti flaggati dello stesso commit: file, righe modificate, tipo). Regola 0: una modifica solo preparatoria (nuove variabili, dichiarazioni, attributi) con header/include modificati nello stesso commit è `UNDETERMINABLE`, non `WRONG_LABEL_IRRELEVANT` (caso `file_tryelf` / `elfclass.h`). `PROMPT_VERSION` passa a `v11-siblings`: i risultati già nel checkpoint restano validi ma vengono segnalati come di versione diversa.
 
 ### 3. Statistiche (`stats.py`)
 
@@ -112,13 +119,14 @@ Opzioni: `--only-disagreements`, `--include-parse-errors`, `--repo-map` (JSON `{
 | `--model` | `gemini-3.8-flash` | Modello Gemini |
 | `--workers` | `4` | Richieste parallele |
 | `--rpm` | `10` | Tetto richieste/minuto lato client (0 = nessun tetto). **Impostalo al limite del tuo account** |
-| `--temperature` / `--seed` | `0.2` / `42` | Campionamento / riproducibilità |
-| `--votes` | `1` | Risposte per funzione per il voto di maggioranza (dispari; 3 = massima precisione, 3× chiamate) |
+| `--temperature` / `--seed` | `1` / `42` | Campionamento / riproducibilità |
+| `--votes` | `1` | Risposte per funzione per il voto di maggioranza (dispari; 3 = massima precisione) |
+| `--vote-policy` | `adaptive` | `adaptive`: 1 campione per funzione, gli altri `votes-1` solo se la risposta contraddice la label del dataset o è inutilizzabile (~1,3× chiamate invece di 3×); `always`: tutti i voti per ogni funzione |
 | `--no-commit-verdict` | `False` | Non caratterizzare il commit una volta (solo ablazione) |
 | `--no-schema` | `False` | Non inviare `responseSchema` |
 | `--retry-errors` | `False` | Al resume, ririchiede i record con `parse_error` |
 | `--timeout` | `300` | Timeout per richiesta (s) |
-| `--retries` | `5` | Tentativi su errori transitori (5xx/rete), back-off esponenziale |
+| `--retries` | `6` | Tentativi su errori transitori (5xx/rete), back-off esponenziale con jitter (10 s … 120 s) |
 | `--max-output-tokens` | `32768` | Token massimi in output (thinking incluso) |
 | `--thinking` | `high` | `minimal` / `low` / `medium` / `high` / `default` (= non inviare `thinkingConfig`) |
 | `--base-url` | API Google | Solo per proxy/test |

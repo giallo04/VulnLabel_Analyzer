@@ -51,12 +51,13 @@ _CATEGORY_ALIASES = {
 COMMIT_NATURES = ("defect_fix", "hardening_or_cleanup", "feature", "unclear")
 COMMIT_SCOPES = ("localized", "distributed", "sweep", "unknown")
 
-PROMPT_VERSION = "2026-10-zero-shot-cot-v10-gemma-local"
+PROMPT_VERSION = "2026-10-zero-shot-cot-v11-siblings"
 FEW_SHOT_DEFAULT = False       # True (or few_shot=True per call) includes the worked examples
 MAX_DIFF_CHARS = 12000
 MAX_FUNC_CHARS = 6000
 MAX_MSG_CHARS = 3000           # commit message in the per-function prompt
 MAX_COMMIT_MSG_CHARS = 5000    # commit message in the commit-level prompt
+MAX_SIBLINGS_LISTED = 12       # other flagged functions of the commit shown in the prompt
 
 
 def _use_few_shot(few_shot: Optional[bool]) -> bool:
@@ -145,7 +146,11 @@ _DECISION = """\
 <decision_procedure>
 Apply the rules in order and stop at the first one that holds.
 Rule 0  Evidence problem: "(NOT AVAILABLE ...)", a diff that shows code of a different function,
-        or a diff cut off exactly at the decisive lines -> UNDETERMINABLE.
+        or a diff cut off exactly at the decisive lines -> UNDETERMINABLE. The same holds when
+        the visible change is only preparatory (new local variables, a declaration, a visibility
+        or storage attribute) and <commit_siblings> lists a changed header, include or unnamed
+        fragment of the same commit that may be textually included in this function: the code
+        that uses the change is not shown, so do not call it irrelevant.
 Rule 1  "(no changed lines inside this function)" or "(only whitespace or formatting differs
         ...)" -> WRONG_LABEL_IRRELEVANT.
 Rule 2  Flaw here: a pre-fix line (a '-' line or the pre-fix body) performs an unsafe operation
@@ -211,6 +216,9 @@ _EVIDENCE = """\
   commit message or from <commit_verdict>.
 - "(no changed lines ...)" means no change, "(only whitespace or formatting differs ...)" means
   a layout-only change, "(NOT AVAILABLE ...)" means there is no usable diff: apply Rules 0 and 1.
+- <commit_siblings> (when present) lists the other flagged functions or fragments of the same
+  commit with their file, size of change and kind. It is context only: never credit this
+  function with their changes; use it to tell whether the decisive code may live elsewhere.
 - If the diff is truncated, judge the visible lines.
 - Derive claims from the visible body and diff; do not assume callers, inputs or data flows
   that the code does not show.
@@ -415,7 +423,7 @@ def _clip_message(msg: Any, limit: int) -> str:
 _OWN_TAGS = ("role", "categories", "decision_procedure", "method", "evidence_rules",
              "output_format", "examples", "commit", "commit_context", "commit_verdict",
              "function_under_review", "function_diff", "function_body", "task", "natures",
-             "scopes")
+             "scopes", "commit_siblings")
 _TAG_RE = re.compile(r"</?\s*(?:%s)\s*>" % "|".join(_OWN_TAGS), re.IGNORECASE)
 
 
@@ -974,6 +982,30 @@ def _format_commit_verdict(verdict: Optional[Dict[str, Any]]) -> str:
 # Layout: blocks shared by all functions of a commit come FIRST (prefix-cache friendly), then
 # the function-specific blocks, with the decisive diff and the task last.
 # ---------------------------------------------------------------------------
+def _siblings_block(record: Dict[str, Any]) -> str:
+    """Compact list of the other flagged functions of the commit (empty string when none)."""
+    sibs = [x for x in (record.get("siblings") or []) if isinstance(x, dict)]
+    if not sibs:
+        return ""
+    own_file = (record.get("location") or {}).get("file")
+    lines = []
+    for x in sibs[:MAX_SIBLINGS_LISTED]:
+        name = x.get("name") or "(unnamed fragment, e.g. header/include)"
+        if x.get("located") is False:
+            lines.append(f"- {name}: not located in the repository")
+            continue
+        where = x.get("file") or "?"
+        same = " [same file]" if own_file and where == own_file else ""
+        lines.append(f"- {name} ({where}{same}): {x.get('changed', '?')} changed lines, "
+                     f"kind={x.get('kind') or '?'}")
+    more = len(sibs) - len(lines)
+    if more > 0:
+        lines.append(f"- ... and {more} more")
+    body = _defang("\n".join(lines))
+    return (f"<commit_siblings>\nOther flagged functions of this commit "
+            f"({len(sibs)}), largest change first:\n{body}\n</commit_siblings>\n\n")
+
+
 def _build_record_part(record: Dict[str, Any], ctx: Optional[Dict[str, Any]] = None,
                        commit_verdict: Optional[Dict[str, Any]] = None) -> str:
     ctx = ctx or analyze_record(record)
@@ -1007,7 +1039,7 @@ CVEs cited: {', '.join(cves) if cves else 'none'}
 {_format_commit_verdict(commit_verdict)}
 </commit_verdict>
 
-<function_under_review>
+{_siblings_block(record)}<function_under_review>
 Name     : {_resolve_func_name(record)}
 File     : {loc.get("file", "(unknown)")} (lines {loc.get("start_line", "?")}-{loc.get("end_line", "?")})
 Version  : {_SIDE_LABEL.get(side, side)}

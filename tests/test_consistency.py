@@ -125,7 +125,7 @@ class TestRetriesAndVotes(Base):
                 return llm_json(seq[(n[0] - 1) % 3])
 
         self.mock.answer = answer
-        self.run_main("--votes", "3", "--workers", "1")
+        self.run_main("--votes", "3", "--vote-policy", "always", "--workers", "1")
         row = self.lines()[0]
         self.assertEqual((row["category"], row["predicted_target"], row["n_votes"]), ("CORRECT_LABEL", 1, 3))
         self.assertAlmostEqual(row["agreement"], 2 / 3)
@@ -143,7 +143,7 @@ class TestRetriesAndVotes(Base):
                 return llm_json(seq[(n[0] - 1) % 2])
 
         self.mock.answer = answer
-        self.run_main("--votes", "2", "--workers", "1")
+        self.run_main("--votes", "2", "--vote-policy", "always", "--workers", "1")
         row = self.lines()[0]
         self.assertEqual((row["category"], row["predicted_target"], row["vote_tie"]),
                          ("UNDETERMINABLE", -1, True))
@@ -159,7 +159,7 @@ class TestRetriesAndVotes(Base):
                 return llm_json(seq[(n[0] - 1) % 2])
 
         self.mock.answer = answer
-        self.run_main("--votes", "2", "--workers", "1")
+        self.run_main("--votes", "2", "--vote-policy", "always", "--workers", "1")
         row = self.lines()[0]
         self.assertEqual(row["category"], "UNDETERMINABLE")
         self.assertEqual(row["predicted_target"], 0)
@@ -170,7 +170,7 @@ class TestRetriesAndVotes(Base):
 
     def test_all_parse_errors_marks_distinct_flag(self):
         self.mock.answer = lambda body, prompt: "garbage"
-        self.run_main("--votes", "2", "--workers", "1")
+        self.run_main("--votes", "2", "--vote-policy", "always", "--workers", "1")
         row = self.lines()[0]
         self.assertTrue(row["parse_error"])
         self.assertTrue(row.get("all_parse_errors"))
