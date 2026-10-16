@@ -12,14 +12,8 @@ The graph is used for two things:
    the strongly connected components; mutually recursive functions form one component and are
    ordered by file/line). ``CommitGraph.order`` is that list.
 2. **Context.** When a function is analysed, ``CommitGraph.context_for`` describes how it sits in
-   the graph (callees, callers, mutually recursive peers, indirect callees) together with the
-   label already assigned to each related function and a one-line reason. ``prompting`` renders
-   it as ``<commit_callgraph>``.
-
-Limits (by design): only functions present in the dataset for the commit are nodes, so calls to
-code outside that set are invisible; calls through function pointers or macros are not
-resolved; member calls (``obj->f()``, ``obj.f()``) are ignored except ``this->f()``. The graph
-is evidence about the *structure* of the commit, never a verdict.
+   the graph (callees, callers) together with the label already assigned to each related function
+   and a one-line reason. ``prompting`` renders it as ``<commit_callgraph>``.
 """
 from __future__ import annotations
 
@@ -28,10 +22,21 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
-from .prompting import commit_key, resolve_func_name
+from .prompting import resolve_func_name
 
-MAX_INDIRECT_HOPS = 3        # indirect callees shown up to this distance
 REASON_CHARS = 200           # length of the one-line explanation attached to a label
+
+
+# ---------------------------------------------------------------------------
+# Commit Key (Re-implemented locally after prompt.py simplification)
+# ---------------------------------------------------------------------------
+def commit_key(record: Dict[str, Any]) -> str:
+    """Cache key for grouping functions by commit."""
+    commit = record.get("commit") or {}
+    for cand in (record.get("commit_id"), commit.get("id"), commit.get("sha"), commit.get("hash")):
+        if cand:
+            return str(cand)
+    return f"{record.get('project', '?')}::{(commit.get('message') or '')[:80]}"
 
 
 # ---------------------------------------------------------------------------
@@ -80,11 +85,7 @@ def _one_line(text: str) -> str:
 
 
 def brief_reason(result: Dict[str, Any], limit: int = REASON_CHARS) -> str:
-    """Compact explanation of a label, built from fields already in the result (no extra call).
-
-    LLM result: ``Rule N`` of step_3_role + first sentence of step_1_change.
-    Deterministic result: the pre-filter rule names.
-    """
+    """Compact explanation of a label, built from fields already in the result."""
     if result.get("method") == "deterministic":
         rules = result.get("prefilter_rules") or []
         if rules == ["diff_unrecoverable"]:
@@ -135,7 +136,6 @@ class CommitGraph:
     recursive: Set[str]                    # functions that call themselves directly
     n_ambiguous: int = 0                   # call names matching functions in >= 2 other files
 
-    # -- queries ------------------------------------------------------------
     def __len__(self) -> int:
         return len(self.nodes)
 
@@ -145,85 +145,34 @@ class CommitGraph:
     def has_cycles(self) -> bool:
         return any(len(m) > 1 for m in self.scc_members.values())
 
-    def _closure(self, start: str, edges: Dict[str, List[str]]) -> Set[str]:
-        seen: Set[str] = set()
-        todo = list(edges.get(start, ()))
-        while todo:
-            x = todo.pop()
-            if x in seen or x == start:
-                continue
-            seen.add(x)
-            todo.extend(edges.get(x, ()))
-        return seen
-
-    def context_for(self, h: str, analyzed: Dict[str, Dict[str, Any]], *,
-                    show_labels: bool = True) -> Optional[Dict[str, Any]]:
-        """Plain-data description of function `h` in the graph, or None when the commit has a
-        single function (nothing to add).
-
-        `analyzed` maps hash -> result (category, step_*, ...) of the functions of this commit
-        that already have a verdict; the others are reported as "no verdict yet".
-        """
+    def context_for(self, h: str, analyzed: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Plain-data description of function `h` in the graph (callees & callers only)."""
         if h not in self.nodes or len(self.nodes) < 2:
             return None
         me = self.nodes[h]
 
-        def entry(x: str, hops: int) -> Dict[str, Any]:
+        def entry(x: str) -> Dict[str, Any]:
             n = self.nodes[x]
             res = analyzed.get(x)
             return {"name": n.name, "file": n.file, "same_file": n.file == me.file,
-                    "hops": hops,
                     "label": res.get("category") if res else None,
                     "reason": brief_reason(res) if res else ""}
-
-        def ordered(hs: Iterable[str]) -> List[str]:
-            return sorted(set(hs), key=lambda x: self.pos[x])
-
-        callees = [entry(x, 1) for x in self.callees[h]]
-        callers = [entry(x, 1) for x in self.callers[h]]
-        peers_h = [x for x in self.scc_members[self.scc_of[h]] if x != h]
-        peers = [entry(x, 0) for x in peers_h]
-
-        seen = {h, *self.callees[h], *peers_h}
-        frontier, indirect_h = list(self.callees[h]), []
-        for hops in range(2, MAX_INDIRECT_HOPS + 1):
-            nxt: List[str] = []
-            for x in frontier:
-                for y in self.callees[x]:
-                    if y not in seen:
-                        seen.add(y)
-                        nxt.append(y)
-                        indirect_h.append((y, hops))
-            frontier = nxt
-        indirect = [entry(y, hops) for y, hops in sorted(indirect_h, key=lambda t: self.pos[t[0]])]
-
-        related = ({h} | self._closure(h, self.callees) | self._closure(h, self.callers)
-                   | set(peers_h))
-        others = Counter(res.get("category") for x, res in analyzed.items()
-                         if x in self.nodes and x not in related and res.get("category"))
 
         return {
             "position": self.pos[h] + 1, "total": len(self.order), "depth": self.depth[h],
             "recursive": h in self.recursive,
-            "callees": callees, "callers": callers, "peers": peers, "indirect": indirect,
-            "others": {"total": sum(others.values()), "by_label": dict(others.most_common())},
-            "show_labels": bool(show_labels),
+            "callees": [entry(x) for x in self.callees[h]],
+            "callers": [entry(x) for x in self.callers[h]],
         }
 
 
 def result_fields(graph_ctx: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """Traceability fields stored next to each result."""
+    """Traceability fields stored next to each result (aligned with minimized prompting)."""
     if not graph_ctx:
         return {"callgraph": False}
-    shown = 0
-    if graph_ctx.get("show_labels", True):
-        for k in ("callees", "callers", "peers", "indirect"):
-            shown += sum(1 for e in graph_ctx[k] if e.get("label"))
-        shown += graph_ctx["others"]["total"]
     return {"callgraph": True, "cg_position": graph_ctx["position"], "cg_total": graph_ctx["total"],
             "cg_depth": graph_ctx["depth"], "cg_n_callees": len(graph_ctx["callees"]),
-            "cg_n_callers": len(graph_ctx["callers"]), "cg_n_peers": len(graph_ctx["peers"]),
-            "cg_labels_shown": shown, "cg_labels_hidden": not graph_ctx.get("show_labels", True)}
+            "cg_n_callers": len(graph_ctx["callers"])}
 
 
 # ---------------------------------------------------------------------------

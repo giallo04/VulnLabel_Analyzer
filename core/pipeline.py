@@ -13,13 +13,6 @@ What is NOT written to the checkpoint (so it is retried on the next run):
 daily quota exhausted, invalid key, API unreachable/overloaded after the retries.
 Blocked or unparsable answers are recorded as ``UNDETERMINABLE`` with ``parse_error=true``
 (``retry_errors=True`` re-queries them on resume).
-
-Consistency
------------
-Each commit is characterised ONCE (``core/commit_verdict.py``) and the verdict is injected
-unchanged into the prompt of every function of that commit. Optional self-consistency
-(``votes`` > 1): majority vote over several sampled answers; a tie is recorded as
-``UNDETERMINABLE`` (precision over coverage) with ``vote_tie=true``.
 """
 from __future__ import annotations
 
@@ -33,14 +26,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
-from .callgraph import CommitGraph, build_graphs, result_fields, summarize_graphs
+from .callgraph import CommitGraph, build_graphs, commit_key, result_fields, summarize_graphs
 from .checkpoint import CheckpointWriter, load_checkpoint_deduped
-from .commit_verdict import CommitVerdicts
 from .deterministic import deterministic_classify, undeterminable_no_diff
 from .llm_engine import LLMAbort, LLMConfig, LLMTransientError, query_llm_ex
 from .parser import parse_llm_response
 from .prompting import (GEMINI_RESPONSE_SCHEMA, PROMPT_VERSION, aggregate_votes, analyze_record,
-                        build_messages, commit_key, diff_available, prompt_meta)
+                        build_messages, diff_available, prompt_meta)
 
 MAX_CONSECUTIVE_TRANSIENT = 8   # stop after this many back-to-back transient failures
 MAX_PARSE_ATTEMPTS = 3          # new samples for the same prompt when the answer is not parsable
@@ -88,18 +80,9 @@ def _ask_once(msgs: Dict[str, str], cfg: LLMConfig, *, seed: int, temperature: f
 
 
 def _combine(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Majority vote over the samples (parse failures ignored). One sample = that sample.
-
-    Extended cases:
-    - All samples are parse errors → UNDETERMINABLE, all_parse_errors=True, vote_tie=False.
-    - Category tie but binary target is unanimous → preserve binary prediction with
-      category=UNDETERMINABLE and category_tie=True (still in the accuracy denominator as noise
-      detection; only the sub-category is unknown).
-    - Category tie AND binary tie → full UNDETERMINABLE, vote_tie=True (excluded from denominator).
-    """
+    """Majority vote over the samples (parse failures ignored)."""
     valid = [p for p in samples if not p["parse_error"]]
     if not valid:
-        # All parse errors: not a tie — a total failure. Keep vote_tie=False for clarity.
         return {**samples[0], "n_votes": len(samples), "agreement": 0.0, "vote_counts": {},
                 "vote_tie": False, "all_parse_errors": True}
     if len(samples) == 1:
@@ -110,14 +93,11 @@ def _combine(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
     if agg["tie"]:
         rep = dict(valid[0])
         if not agg["target_tie"]:
-            # Category split, but binary vote is unanimous (e.g. all WRONG_LABEL_* variants).
-            # Preserve the binary result: it is valid evidence; only the sub-category is unknown.
             binary_target = agg["predicted_target"]
             rep.update(category="UNDETERMINABLE", predicted_target=binary_target)
             return {**rep, "n_votes": len(samples), "agreement": agg["agreement"],
                     "vote_counts": agg["counts"], "vote_tie": False, "category_tie": True,
                     "all_parse_errors": False}
-        # Both category and binary are tied: true UNDETERMINABLE (precision over coverage).
         rep.update(category="UNDETERMINABLE", predicted_target=-1)
         return {**rep, "n_votes": len(samples), "agreement": agg["agreement"],
                 "vote_counts": agg["counts"], "vote_tie": True, "category_tie": True,
@@ -129,63 +109,42 @@ def _combine(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def _needs_escalation(sample: Dict[str, Any], original_target: int) -> bool:
-    """Adaptive voting: is one sample enough, or must the remaining votes be drawn?
-
-    Escalate when the single answer is unusable (parse error / UNDETERMINABLE) or when it
-    CONTRADICTS the dataset label (a suspected noise record: the only verdict that changes the
-    final statistics, so the only one worth paying extra votes for). An answer that confirms
-    the original label is kept as is.
-    """
     if sample["parse_error"] or sample["category"] == "UNDETERMINABLE":
         return True
     return sample["predicted_target"] != original_target
 
 
 def process_record(record: Dict[str, Any], cfg: LLMConfig, *,
-                   verdicts: Optional[CommitVerdicts] = None,
-                   ctx: Optional[Dict[str, Any]] = None, votes: int = 1,
+                   votes: int = 1,
                    vote_policy: str = "always",
                    graph_ctx: Optional[Dict[str, Any]] = None,
                    graphs: Optional[Dict[str, CommitGraph]] = None,
-                   analyzed: Optional[Dict[str, Dict[str, Any]]] = None,
-                   show_graph_labels: bool = True) -> Dict[str, Any]:
-    """Full LLM cycle for a single record. Returns a result dict.
-
-    The commit verdict (when `verdicts` is given) is shared by all the functions of the commit.
-    """
+                   analyzed: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """Full LLM cycle for a single record. Returns a result dict."""
     if graph_ctx is None and graphs is not None and analyzed is not None:
         g = graphs.get(commit_key(record))
         if g is not None:
-            graph_ctx = g.context_for(str(record.get("hash", "")), analyzed, show_labels=show_graph_labels)
+            graph_ctx = g.context_for(str(record.get("hash", "")), analyzed)
 
-    verdict = verdicts.get(record, ctx) if verdicts is not None else None
-    # Pre-compute the diff analysis ONCE and share between build_messages and prompt_meta,
-    # eliminating the double parse of the diff string that was happening before.
     diff_ctx = analyze_record(record)
-    msgs = build_messages(record, verdict, ctx=diff_ctx, graph_ctx=graph_ctx)   # stateless: pure function of record + verdict
-    meta = prompt_meta(record, verdict, ctx=diff_ctx, graph_ctx=graph_ctx)
+    msgs = build_messages(record, ctx=diff_ctx, graph_ctx=graph_ctx)
+    meta = prompt_meta(record, ctx=diff_ctx, graph_ctx=graph_ctx)
 
     votes = max(1, int(votes))
     temperature = cfg.temperature if votes == 1 else max(cfg.temperature, VOTE_MIN_TEMPERATURE)
     original_target = int(record.get("target", -1))
+    
     samples = [_ask_once(msgs, cfg, seed=cfg.seed + 101 * 0, temperature=temperature)]
-    # vote_policy='adaptive': the extra votes are bought only for suspected noise / unusable
-    # answers; 'always' (legacy) draws all `votes` samples for every record.
     if votes > 1 and (vote_policy == "always" or _needs_escalation(samples[0], original_target)):
         samples += [_ask_once(msgs, cfg, seed=cfg.seed + 101 * i, temperature=temperature)
                     for i in range(1, votes)]
     parsed = _combine(samples)
 
     predicted_target = parsed["predicted_target"]
-
     change = record.get("change") or {}
     signals = record.get("signals") or {}
     location = record.get("location") or {}
 
-    # is_noise: the predicted target contradicts the original label AND is a definitive verdict
-    # (not -1). This includes the binary-unanimous/category-tied case (predicted_target=0/1 but
-    # category=UNDETERMINABLE with category_tie=True) — those ARE noise signals, just uncertain
-    # about the specific sub-category.
     is_noise = original_target != predicted_target and predicted_target != -1
 
     return {
@@ -200,16 +159,10 @@ def process_record(record: Dict[str, Any], cfg: LLMConfig, *,
         "category": parsed["category"],
         "method": "llm",
         "model": cfg.model_name,
-        "thinking_level": cfg.thinking_level,
+        "thinking_level": getattr(cfg, 'thinking_level', None),
         "prompt_version": meta["prompt_version"],
         "diff_truncated": meta["diff_truncated"],
         "diff_method": meta["diff_method"],
-        # commit description: identical for every function of the commit
-        "commit_nature": meta["commit_nature"],
-        "commit_root_cause": meta["commit_root_cause"],
-        "commit_fix_pattern": meta["commit_fix_pattern"],
-        "commit_fix_scope": meta["commit_fix_scope"],
-        "commit_verdict_fallback": bool((verdict or {}).get("fallback", False)),
         # call graph context & traceability
         **result_fields(graph_ctx),
         # full reasoning
@@ -225,7 +178,7 @@ def process_record(record: Dict[str, Any], cfg: LLMConfig, *,
         "agreement":       parsed["agreement"],
         "vote_counts":     parsed["vote_counts"],
         "vote_tie":        parsed["vote_tie"],
-        "category_tie":    parsed.get("category_tie", False),   # category split, binary unanimous
+        "category_tie":    parsed.get("category_tie", False),
         "all_parse_errors": parsed.get("all_parse_errors", False),
         # enricher signals (downstream analysis)
         "rank_in_commit":        change.get("rank_in_commit"),
@@ -277,22 +230,15 @@ def _log(msg: str) -> None:
     print(msg, file=sys.stderr)
 
 
-def estimate_calls(n_records: int, n_commits: int, n_verdicts_cached: int, votes: int,
-                   vote_policy: str, noise_rate: float = 0.35) -> Dict[str, float]:
-    """Expected number of API calls (min / expected / max) for a run.
-
-    `noise_rate` is the assumed share of records the model contradicts (escalated to the full
-    vote under the adaptive policy); only used for the 'expected' figure.
-    """
-    commit_calls = max(0, n_commits - n_verdicts_cached)
-    lo = n_records + commit_calls
-    hi = n_records * max(1, votes) + commit_calls
+def estimate_calls(n_records: int, votes: int, vote_policy: str, noise_rate: float = 0.35) -> Dict[str, float]:
+    lo = n_records
+    hi = n_records * max(1, votes)
     if votes <= 1:
         exp = hi
     elif vote_policy == "always":
         exp = hi
     else:
-        exp = n_records * (1 + noise_rate * (votes - 1)) + commit_calls
+        exp = n_records * (1 + noise_rate * (votes - 1))
     return {"min": lo, "expected": exp, "max": hi}
 
 
@@ -300,13 +246,11 @@ def _fmt_hours(h: float) -> str:
     return f"{h * 60:.0f} min" if h < 1 else f"{h:.1f} h"
 
 
-def _log_estimate(n_records: int, n_commits: int, n_cached: int, votes: int, vote_policy: str,
-                  cfg: LLMConfig) -> None:
-    """Tell the user up front what the chosen flags cost (the rpm floor is a hard bound)."""
+def _log_estimate(n_records: int, votes: int, vote_policy: str, cfg: LLMConfig) -> None:
     if n_records <= 0:
         return
-    est = estimate_calls(n_records, n_commits, n_cached, votes, vote_policy)
-    if cfg.rpm and cfg.rpm > 0:
+    est = estimate_calls(n_records, votes, vote_policy)
+    if getattr(cfg, 'rpm', None) and cfg.rpm > 0:
         floor = {k: v / cfg.rpm / 60 for k, v in est.items()}
         _log(f"  → estimate: ~{est['expected']:.0f} API calls ({est['min']:.0f}-{est['max']:.0f}); "
              f"at rpm={cfg.rpm:g} that is >= {_fmt_hours(floor['expected'])} "
@@ -333,11 +277,9 @@ def run_pipeline(
     skip_deterministic: bool = False,
     stop: Optional[threading.Event] = None,
     votes: int = 1,
-    use_commit_verdict: bool = True,
     retry_errors: bool = False,
     vote_policy: str = "adaptive",
     use_callgraph: bool = True,
-    show_graph_labels: bool = True,
 ) -> RunOutcome:
     """Classify `records` with `cfg`, appending every result to `checkpoint`."""
     out = RunOutcome(n_selected=len(records))
@@ -364,6 +306,7 @@ def run_pipeline(
             _log(f"  ⚠ {stale} checkpoint results were produced with a different prompt version "
                  f"(current: {PROMPT_VERSION}); they are kept and NOT re-run. Use a new --out-dir "
                  f"(or --no-resume) to re-classify them with the current prompt.")
+    
     todo = [r for r in records if str(r.get("hash", "")) not in already_done]
     out.n_resumed = len(records) - len(todo)
     _log(f"  → {len(todo)} records remaining ({out.n_resumed} already done)")
@@ -400,8 +343,6 @@ def run_pipeline(
     if unusable:
         skip = {id(r) for r in unusable}
         to_llm = [r for r in to_llm if id(r) not in skip]
-        # schema >= 3: the enricher already did its best (function-pair comparison) -> final
-        # UNDETERMINABLE, checkpointed; older schemas: --refresh can still recover the diff
         final = [r for r in unusable
                  if int(r.get("schema_version") or 1) >= ENRICH_SCHEMA_WITH_PAIR_DIFF]
         final_ids = {id(r) for r in final}
@@ -423,7 +364,7 @@ def run_pipeline(
         h = str(det.get("hash", ""))
         ck = commit_key(det)
         g = graphs.get(ck)
-        cg = g.context_for(h, analyzed, show_labels=show_graph_labels) if (g and use_callgraph) else None
+        cg = g.context_for(h, analyzed) if (g and use_callgraph) else None
         det.update(result_fields(cg))
         if h:
             analyzed[h] = det
@@ -459,21 +400,7 @@ def run_pipeline(
 
     ready = [r for r in to_llm if not remaining_deps[str(r.get("hash", ""))]]
 
-    # commit context + shared commit verdicts (one API call per commit)
-    ctx_by_commit: Dict[str, Dict[str, Any]] = {}
-    for r in records:
-        c = ctx_by_commit.setdefault(commit_key(r), {"cwes": set(), "n_selected": 0})
-        c["cwes"].update(r.get("cwe") or [])
-        c["n_selected"] += 1
-    for c in ctx_by_commit.values():
-        c["cwes"] = sorted(c["cwes"])
-    verdicts = (CommitVerdicts(cfg, checkpoint.parent / "commit_verdicts.jsonl")
-                if use_commit_verdict else None)
-    if verdicts is not None and verdicts.n_loaded:
-        _log(f"  → {verdicts.n_loaded} commit verdicts reused from commit_verdicts.jsonl")
-
-    _log_estimate(len(to_llm), len({commit_key(r) for r in to_llm}) if use_commit_verdict else 0,
-                  verdicts.n_loaded if verdicts is not None else 0, votes, vote_policy, cfg)
+    _log_estimate(len(to_llm), votes, vote_policy, cfg)
 
     written = 0
     if todo:
@@ -493,10 +420,10 @@ def run_pipeline(
             if g is not None and use_callgraph:
                 with state_lock:
                     snap = dict(analyzed)
-                graph_ctx = g.context_for(h, snap, show_labels=show_graph_labels)
+                graph_ctx = g.context_for(h, snap)
             try:
                 payload = process_record(
-                    r, cfg, verdicts=verdicts, ctx=ctx_by_commit.get(ck), votes=votes,
+                    r, cfg, votes=votes,
                     vote_policy=vote_policy, graph_ctx=graph_ctx)
                 return "ok", r, payload
             except LLMAbort as exc:
@@ -562,7 +489,7 @@ def run_pipeline(
                                 if out.status != "stopped":
                                     out.status = "stopped"
                                     out.reason = f"{type(payload).__name__}: {payload}"
-                            _progress(n_done, n_total, t0)
+                        _progress(n_done, n_total, t0)
                 except KeyboardInterrupt:
                     stop.set()
                     out.status = "interrupted"
@@ -577,9 +504,6 @@ def run_pipeline(
     else:
         out.status = "nothing_to_do"
 
-    if verdicts is not None and verdicts.n_api_calls:
-        _log(f"  → commit verdicts: {verdicts.n_api_calls} API calls for "
-             f"{len(ctx_by_commit)} commits")
     out.n_new = written
     out.results = load_checkpoint_deduped(checkpoint) if checkpoint.exists() else []
     done_now = {str(r.get("hash")) for r in out.results}
