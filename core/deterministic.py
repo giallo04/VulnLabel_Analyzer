@@ -1,66 +1,53 @@
 """Pre-filtro deterministico — tassonomia DiverseVul.
 
-Classifica senza LLM le funzioni con modifica puramente cosmetica o in path di test/esempi/fuzz.
-Produce risultati nella stessa forma di process_record().
+Classifica senza LLM le funzioni (a) in path di test/esempi/fuzz e (b) con modifica puramente
+cosmetica VERIFICATA sul codice. Produce risultati nella stessa forma di process_record().
+Tutto ciò che non è verificabile → None (necessita LLM).
 
-Mapping deterministico → categoria DiverseVul:
-  file di test/esempi/fuzz CONFERMATO dal path               → WRONG_LABEL_IRRELEVANT
-  modifica cosmetica VERIFICATA sul codice:
-      - commento/doc cambiato E nome funzione nel messaggio  → WRONG_LABEL_CONSISTENCY (Q1:
-        il commento documenta il comportamento cambiato altrove)
-      - altrimenti (whitespace, commenti non legati al fix)  → WRONG_LABEL_IRRELEVANT
-  Tutto il resto (incluso ciò che non è verificabile)        → None  (necessita LLM)
-`predicted_target` è sempre 0: cambia solo la ripartizione per categoria.
+Mapping → categoria DiverseVul (`predicted_target` segue CATEGORY_TO_TARGET: 0, o -1 per
+undeterminable_no_diff):
+  path di test/esempi/fuzz CONFERMATO dal path                  → WRONG_LABEL_IRRELEVANT
+  cosmetico verificato, commento/doc modificato E funzione
+    citata nel messaggio di commit (documenta il fix)           → WRONG_LABEL_CONSISTENCY
+  cosmetico verificato, altrimenti (whitespace, commenti non
+    legati al fix, nessuna riga toccata)                        → WRONG_LABEL_IRRELEVANT
+La politica cosmetica è unica e vive in prompting.cosmetic_verdict() (condivisa con
+prompting.precheck e con le Rule 1/5/6 del prompt LLM).
 
-Novità rispetto alla versione precedente
-----------------------------------------
-- La regola `test_path` scatta anche dal solo path (anche con file_is_test=False) e copre
-  `libtests/`, `examples/`, `fuzz/`, `*-ctest.c`, `standalone_fuzz_*`, ecc.: sono wrapper/driver
-  che passano argv a API controllate, non riparano la libreria.
-- Un commento/doc modificato (token stream identico, ma testo diverso oltre il whitespace) con
-  `name_in_message=True` va a CONSISTENCY invece che a IRRELEVANT.
+Record atteso
+-------------
+  func       codice della funzione, SOLO sul lato `location.side`
+  location   {file, start_line, end_line, side: "old"|"new", method, n_matches, score}
+             (start/end_line: righe nel file del lato `side`)
+  change     {kind, file_is_test, hunks (diff unificato dell'INTERO file, può essere troncato),
+              hunks_truncated, function_diff, function_diff_truncated, diff_method,
+              diff_reliable, rank_in_commit, share_of_source_churn, frac_changed, ...}
+  signals, siblings, commit
 
-Formato del record atteso (schema_version 1)
---------------------------------------------
-  func                 codice della funzione, SOLO sul lato `location.side`
-  location             {file, start_line, end_line, side: "old"|"new", method, n_matches, score}
-                       start/end_line sono numeri di riga nel file del lato `side`
-  change               {deleted, inserted, changed, frac_changed, kind, file_is_test,
-                        hunks (diff unificato dell'INTERO file, può essere troncato),
-                        hunks_truncated, rank_in_commit, share_of_source_churn}
-  siblings, signals, commit
-
-Come viene verificata la natura cosmetica
------------------------------------------
-`change.kind` è trattato come un'ipotesi da verificare, non come un fatto: se
-l'enricher lo calcola confrontando insiemi di righe, lo spostamento di istruzioni
-può risultare "none"/"whitespace".
-
-1. VERIFICA ORDER-SENSITIVE. Nel record c'è una sola versione della funzione (`func`)
-   e il diff è a livello di file. Quindi:
-     a. si controlla che le righe del diff cadute nell'intervallo [start_line, end_line]
-        coincidano con `func` (altrimenti la localizzazione è inaffidabile);
-     b. si raggruppano le righe modificate in blocchi (righe '-'/'+' consecutive) e si
-        tengono solo quelli interamente DENTRO la funzione;
-     c. si ricostruisce il lato opposto sostituendo in `func` i blocchi con il loro
-        contenuto sull'altro lato;
-     d. le due versioni vengono tokenizzate (C/C++, commenti rimossi, stringhe
-        preservate, newline significativi solo nelle direttive del preprocessore,
-        `#define X(a)` distinto da `#define X (a)`) e i flussi di token confrontati
-        IN ORDINE. Uno spostamento di istruzioni cambia l'ordine dei token → non è
-        cosmetico → va all'LLM.
-   Un blocco a cavallo del confine della funzione è accettato solo se il blocco stesso
-   ha token identici prima/dopo; altrimenti non si può decidere → LLM.
-   Se `hunks` è troncato e non copre tutta la funzione → LLM.
-2. Se la verifica NON è possibile (nessun hunk, hunk illeggibili/incoerenti, estensione
-   non C-like) il record va SEMPRE all'LLM: nessun fallback euristico sui segnali
-   dell'enricher.
-3. Il path di test va confermato dal path stesso (directory o nome file); il flag
-   `file_is_test` da solo non basta: path come `latest.c` / `contest.c` non sono test.
-4. Localizzazione non esatta (method != "exact", n_matches != 1, score < 1) → `kind`
-   non è affidabile → LLM.
-5. Modifiche strutturali (funzione aggiunta/rimossa/rinominata/spostata) alterano il
-   token stream ricostruito, quindi non sono mai considerate cosmetiche.
+Verifica della natura cosmetica
+-------------------------------
+`change.kind` è un'ipotesi da verificare, non un fatto (se l'enricher confronta insiemi di
+righe, lo spostamento di istruzioni può risultare "none"/"whitespace").
+1. VERIFICA ORDER-SENSITIVE sul diff (`hunks`, in alternativa `function_diff`):
+   a. le righe del diff nell'intervallo [start_line, end_line] devono coincidere con `func`
+      (altrimenti la localizzazione è inaffidabile);
+   b. le righe '-'/'+' consecutive formano blocchi; si tengono quelli interamente DENTRO la
+      funzione;
+   c. si ricostruisce il lato opposto sostituendo in `func` i blocchi con il loro contenuto
+      sull'altro lato;
+   d. le due versioni sono tokenizzate (C/C++, commenti rimossi, stringhe preservate, newline
+      significativi solo nelle direttive, `#define X(a)` ≠ `#define X (a)`) e i token confrontati
+      IN ORDINE: uno spostamento di istruzioni cambia l'ordine → non è cosmetico → LLM.
+   Un blocco a cavallo del confine è accettato solo se ha token identici prima/dopo. Se il diff
+   è troncato e non copre tutta la funzione → LLM.
+2. Verifica impossibile (nessun hunk, hunk illeggibili/incoerenti, estensione non C-like) →
+   SEMPRE LLM: nessun fallback euristico sui segnali dell'enricher.
+3. Il path di test va confermato dal path stesso (directory o nome file): `file_is_test` da solo
+   non basta (`latest.c`, `contest.c` non sono test).
+4. Localizzazione non esatta (method != "exact", n_matches != 1, score < 1) → `kind` inaffidabile
+   → LLM.
+5. Modifiche strutturali (funzione aggiunta/rimossa/rinominata/spostata) alterano il token stream
+   ricostruito: mai cosmetiche.
 """
 from __future__ import annotations
 
@@ -69,12 +56,11 @@ import posixpath
 import re
 from collections import Counter
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
-from .prompting import PROMPT_VERSION
+from .prompting import (CATEGORY_CONSISTENCY, CATEGORY_IRRELEVANT, CATEGORY_TO_TARGET,
+                        PROMPT_VERSION, cosmetic_verdict)
 
-CATEGORY_IRRELEVANT = "WRONG_LABEL_IRRELEVANT"
-CATEGORY_CONSISTENCY = "WRONG_LABEL_CONSISTENCY"
 CATEGORY = CATEGORY_IRRELEVANT  # alias retrocompatibile
 COSMETIC_KINDS = frozenset({"none", "whitespace", "comment_or_blank"})
 
@@ -84,11 +70,18 @@ _C_FAMILY_EXT = frozenset({
     ".inc", ".inl", ".ipp", ".tcc", ".cu", ".cuh", ".m", ".mm",
 })
 
-# Se l'enricher dovesse esporre uno stato strutturale (non presente nello schema v1).
+# Stati strutturali, se l'enricher li espone.
 _STRUCTURAL_STATUS = frozenset({
     "added", "new", "deleted", "removed", "renamed", "moved",
     "signature_changed", "file_moved", "file_renamed",
 })
+
+
+class _Rule(NamedTuple):
+    name: str
+    confidence: str
+    detail: str
+    category: str
 
 
 # --------------------------------------------------------------------------- #
@@ -137,18 +130,16 @@ _TOKEN_RE = re.compile(
 def _tokenize(src: str) -> List[str]:
     """Token stream senza whitespace/commenti.
 
-    - Le stringhe/char literal restano intatte (cambiarne il contenuto NON è cosmetico).
-    - Il newline è un token solo dentro una direttiva del preprocessore, dove
-      termina la direttiva (quindi è semanticamente rilevante).
-    - Line-splice (backslash-newline) rimossi come da fase 2 del preprocessore.
-    - `#define X(a)` (macro funzione) e `#define X (a)` (macro oggetto) producono
-      token diversi: lo spazio dopo il nome è semanticamente rilevante.
+    - Stringhe/char literal intatte (cambiarne il contenuto NON è cosmetico).
+    - Il newline è un token solo dentro una direttiva del preprocessore (ne è il terminatore).
+    - Line-splice (backslash-newline) rimossi (fase 2 del preprocessore).
+    - `#define X(a)` (macro funzione) e `#define X (a)` (macro oggetto) danno token diversi.
     """
     src = _SPLICE_RE.sub("", src)
     tokens: List[str] = []
     line_start = True
     in_directive = False
-    prev_ws = False  # c'era whitespace/commento subito prima del token corrente?
+    prev_ws = False  # whitespace/commento subito prima del token corrente?
     for m in _TOKEN_RE.finditer(src):
         kind, text = m.lastgroup, m.group()
         if kind in ("lcomment", "bcomment", "space"):
@@ -164,7 +155,6 @@ def _tokenize(src: str) -> List[str]:
         if kind == "punct" and text == "#" and line_start:
             in_directive = True
         line_start = False
-        # '#define X(a)' != '#define X (a)'
         if text == "(" and not prev_ws and len(tokens) >= 3 and tokens[-3:-1] == ["#", "define"]:
             text = "(<fn-macro>"
         prev_ws = False
@@ -201,11 +191,11 @@ class _ParsedDiff:
 
 def _parse_hunks(diff: str, truncated: bool) -> Optional[_ParsedDiff]:
     """Parsa gli hunk usando i contatori dell'header (robusto a righe '---'/'+++' nel
-    contenuto). Restituisce None se il diff è illeggibile/incoerente.
+    contenuto). None se il diff è illeggibile/incoerente.
 
-    Se il diff è troncato si scartano la riga finale (può essere tagliata a metà) e
-    l'eventuale blocco di modifiche rimasto aperto: restano solo le righe fino
-    all'ultimo contesto / fine hunk, di cui `known_*` indica la copertura.
+    Se il diff è troncato si scartano la riga finale (può essere tagliata a metà) e l'eventuale
+    blocco di modifiche rimasto aperto: restano le righe fino all'ultimo contesto / fine hunk,
+    di cui `known_*` indica la copertura.
     """
     raw = diff.split("\n")
     if raw and raw[-1] == "":
@@ -271,8 +261,7 @@ def _parse_hunks(diff: str, truncated: bool) -> Optional[_ParsedDiff]:
 
     if hunk < 0:
         return None
-    complete = (not truncated) and not (old_left or new_left)
-    if complete:
+    if not truncated and not (old_left or new_left):
         return _ParsedDiff(lines, math.inf, math.inf)
     return _ParsedDiff(lines[:safe_len], known_old, known_new)
 
@@ -303,13 +292,10 @@ def _group_blocks(lines: List[_DiffLine]) -> List[List[_DiffLine]]:
 class Verification:
     verdict: Optional[bool]  # True = cosmetico confermato, False = NON cosmetico, None = non verificabile
     reason: str
-    # None ma i dati c'erano (troncati / incoerenti / ambigui). Informativo: in ogni
-    # caso verdict=None porta all'LLM.
-    blocking: bool = False
     # True: nessuna riga del diff tocca la funzione (conferma solo kind='none').
     untouched: bool = False
-    # True: token stream identico ma il testo differisce oltre il whitespace → è cambiato
-    # il contenuto di un commento/doc (solo significativo con verdict=True).
+    # True: token stream identico ma il testo differisce oltre il whitespace → è cambiato il
+    # contenuto di un commento/doc (significativo solo con verdict=True).
     comment_edit: bool = False
 
 
@@ -339,30 +325,25 @@ def _squash_ws(text: str) -> str:
     return "".join(text.split())
 
 
-def _verify_from_hunks(record: Dict[str, Any], diff: str) -> Verification:
-    change = record.get("change") or {}
+def _verify_from_hunks(record: Dict[str, Any], diff: str, truncated: bool) -> Verification:
     location = record.get("location") or {}
-
     s = _to_int(location.get("start_line"))
     e = _to_int(location.get("end_line"))
     side = _norm_str(location.get("side"))
     func = record.get("func")
     if s < 1 or e < s or side not in ("old", "new") or not isinstance(func, str) or not func.strip():
-        return Verification(None, "hunk presenti ma func/location incompleti", blocking=True)
+        return Verification(None, "hunk presenti ma func/location incompleti")
 
     func_lines = func.split("\n")
     if func_lines and func_lines[-1] == "":
         func_lines.pop()
     if len(func_lines) != e - s + 1:
         return Verification(
-            None,
-            f"func ({len(func_lines)} righe) incoerente con start/end_line ({e - s + 1} righe)",
-            blocking=True,
-        )
+            None, f"func ({len(func_lines)} righe) incoerente con start/end_line ({e - s + 1} righe)")
 
-    parsed = _parse_hunks(diff, bool(change.get("hunks_truncated")))
+    parsed = _parse_hunks(diff, truncated)
     if parsed is None:
-        return Verification(None, "hunk illeggibili o incoerenti", blocking=True)
+        return Verification(None, "hunk illeggibili o incoerenti")
 
     is_old = side == "old"
     prim_op = "-" if is_old else "+"
@@ -376,10 +357,7 @@ def _verify_from_hunks(record: Dict[str, Any], diff: str) -> Verification:
         if ln.op in (" ", prim_op):
             n = pnum(ln)
             if s <= n <= e and ln.text.strip() != func_lines[n - s].strip():
-                return Verification(
-                    None, f"riga {n} del diff diversa da func: localizzazione inaffidabile",
-                    blocking=True,
-                )
+                return Verification(None, f"riga {n} del diff diversa da func: localizzazione inaffidabile")
 
     # (b) blocchi dentro / a cavallo / fuori dalla funzione
     edits: List[Tuple[int, int, List[str]]] = []  # (indice inizio, indice fine escl., sostituzione)
@@ -409,10 +387,8 @@ def _verify_from_hunks(record: Dict[str, Any], diff: str) -> Verification:
             edits.append((gap - s, gap - s, [ln.text for ln in other]))
 
     # (c) ricostruzione del lato opposto (+ rilevamento di modifiche al testo dei commenti)
-    comment_edit = any(
-        _squash_ws("".join(func_lines[i:j])) != _squash_ws("".join(repl))
-        for i, j, repl in edits
-    )
+    comment_edit = any(_squash_ws("".join(func_lines[i:j])) != _squash_ws("".join(repl))
+                       for i, j, repl in edits)
     other_lines = list(func_lines)
     for i, j, repl in sorted(edits, key=lambda x: (x[0], x[1]), reverse=True):
         other_lines[i:j] = repl
@@ -422,31 +398,36 @@ def _verify_from_hunks(record: Dict[str, Any], diff: str) -> Verification:
     if cmp.verdict is False:
         return cmp
     if straddle_bad:
-        return Verification(None, straddle_bad, blocking=True)
+        return Verification(None, straddle_bad)
     if known < e:
-        return Verification(None, "hunks troncati prima della fine della funzione", blocking=True)
+        return Verification(None, "hunks troncati prima della fine della funzione")
     if not touched:
         return Verification(True, "nessuna riga del diff tocca la funzione", untouched=True)
     return Verification(
         True, "ogni blocco modificato nella funzione ha token stream identico (ordine incluso)",
-        comment_edit=comment_edit,
-    )
+        comment_edit=comment_edit)
+
+
+def _pick_diff(change: Dict[str, Any]) -> Tuple[Optional[str], bool]:
+    """(diff, troncato): `hunks` (file-level) o, in alternativa, `function_diff`, ciascuno con il
+    proprio flag di troncamento."""
+    for key, flag in (("hunks", "hunks_truncated"), ("function_diff", "function_diff_truncated")):
+        diff = change.get(key)
+        if isinstance(diff, str) and "@@" in diff:
+            return diff, bool(change.get(flag))
+    return None, False
 
 
 def verify_cosmetic(record: Dict[str, Any], path: str) -> Verification:
-    """Verifica indipendente da `kind`, se il record contiene func + hunks + location."""
+    """Verifica indipendente da `kind`, se il record contiene func + diff + location."""
     if path:
         ext = posixpath.splitext(path.lower())[1]
         if ext not in _C_FAMILY_EXT:
             return Verification(None, f"estensione {ext or '(nessuna)'} non C-like")
-
-    change = record.get("change") or {}
-    diff = change.get("hunks")
-    if not isinstance(diff, str) or "@@" not in diff:
-        diff = change.get("function_diff")
-    if not isinstance(diff, str) or "@@" not in diff:
+    diff, truncated = _pick_diff(record.get("change") or {})
+    if diff is None:
         return Verification(None, "nessun hunk nel record")
-    return _verify_from_hunks(record, diff)
+    return _verify_from_hunks(record, diff, truncated)
 
 
 def _structural_change(change: Dict[str, Any]) -> Optional[str]:
@@ -460,8 +441,8 @@ def _structural_change(change: Dict[str, Any]) -> Optional[str]:
 # --------------------------------------------------------------------------- #
 # Regole
 # --------------------------------------------------------------------------- #
-# Directory che contengono codice di test, esempi, harness di fuzzing, benchmark: wrapper e
-# driver che non riparano la libreria.
+# Directory con codice di test, esempi, harness di fuzzing, benchmark: wrapper e driver che non
+# riparano la libreria.
 _TEST_DIRS = frozenset({
     # test
     "test", "tests", "testing", "unittest", "unittests", "unit_test", "unit_tests",
@@ -487,120 +468,80 @@ _TEST_FUNC_RE = re.compile(r"^(?:test_|Test[A-Z_])|_test$|^TEST[_(]")
 
 
 def _test_path_strength(path: str) -> str:
+    """"strong" (path di test), "none" (path presente, non di test) o "unknown" (nessun path)."""
     if not path:
         return "unknown"
     parts = path.replace("\\", "/").strip("/").split("/")
-    for p in parts[:-1]:
-        if p.lower() in _TEST_DIRS or _TEST_DIR_SUFFIX_RE.search(p):
-            return "strong"
-    if _TEST_FILE_RE.search(parts[-1]):
+    if any(p.lower() in _TEST_DIRS or _TEST_DIR_SUFFIX_RE.search(p) for p in parts[:-1]):
         return "strong"
-    return "none"
+    return "strong" if _TEST_FILE_RE.search(parts[-1]) else "none"
 
 
-def _rule_test_path(
-    record: Dict[str, Any], change: Dict[str, Any], path: str
-) -> Optional[Tuple[str, str, str, str]]:
+def _rule_test_path(record: Dict[str, Any], change: Dict[str, Any], path: str) -> Optional[_Rule]:
     """Test/esempi/fuzz: scatta dal path anche se l'enricher non ha messo file_is_test."""
     flag = bool(change.get("file_is_test", False))
     strength = _test_path_strength(path)
     if strength == "strong":
-        how = "file_is_test=True confermato dal path" if flag else "path di test/esempio/fuzz (file_is_test=False)"
-        return ("test_path", "high", f"{how} ({path})", CATEGORY_IRRELEVANT)
+        how = ("file_is_test=True confermato dal path" if flag
+               else "path di test/esempio/fuzz (file_is_test=False)")
+        return _Rule("test_path", "high", f"{how} ({path})", CATEGORY_IRRELEVANT)
     if not flag:
         return None
     func_name = str(record.get("func_name") or "")
     if _TEST_FUNC_RE.search(func_name):
-        return ("test_path", "medium", f"file_is_test=True e funzione dal nome di test ({func_name})",
-                CATEGORY_IRRELEVANT)
-    if strength == "unknown":
-        ver = verify_cosmetic(record, path)
-        if ver.verdict is False:
-            # Codice modificato e path non disponibile per verificare che sia un test: LLM
-            return None
-        return ("test_path", "medium", "file_is_test=True (path non disponibile per la conferma)",
-                CATEGORY_IRRELEVANT)
-    # path presente ma non riconducibile a test → il flag è sospetto
+        return _Rule("test_path", "medium",
+                     f"file_is_test=True e funzione dal nome di test ({func_name})",
+                     CATEGORY_IRRELEVANT)
+    # path presente ma non di test → il flag è sospetto; path assente → serve la conferma dal
+    # codice: se risulta modificato (non cosmetico) non si può escludere che sia da analizzare
+    if strength == "unknown" and verify_cosmetic(record, path).verdict is not False:
+        return _Rule("test_path", "medium",
+                     "file_is_test=True (path non disponibile per la conferma)", CATEGORY_IRRELEVANT)
     return None
 
 
-def _rule_cosmetic(
-    record: Dict[str, Any], change: Dict[str, Any], kind: str, path: str
-) -> Optional[Tuple[str, str, str, str]]:
-    """Cosmetico solo se CONFERMATO dal codice; altrimenti None (→ LLM).
-
-    Categoria: CONSISTENCY se è cambiato il testo di un commento/doc E il nome della funzione
-    compare nel messaggio di commit (il commento documenta il comportamento cambiato dal fix,
-    Q1 del prompt); IRRELEVANT altrimenti (whitespace, commenti non legati al fix).
-    """
-    if kind not in COSMETIC_KINDS:
-        return None
-    if _structural_change(change):
-        return None
-    if _location_problem(record.get("location") or {}):
-        return None  # kind calcolato su una localizzazione dubbia → LLM
-
+def _rule_cosmetic(record: Dict[str, Any], change: Dict[str, Any], kind: str,
+                   path: str) -> Optional[_Rule]:
+    """Cosmetico solo se CONFERMATO dal codice; altrimenti None (→ LLM). La categoria viene da
+    prompting.cosmetic_verdict()."""
+    if (kind not in COSMETIC_KINDS or _structural_change(change)
+            or _location_problem(record.get("location") or {})):
+        return None  # kind su localizzazione dubbia o modifica strutturale → LLM
     ver = verify_cosmetic(record, path)
-    if ver.verdict is True:
-        if ver.untouched and kind != "none":
-            # kind dice "whitespace/commenti" ma il diff non tocca la funzione: incoerenza
-            return None
-        detail = f"kind={kind!r}; verificato: {ver.reason}"
-        name_in_msg = bool((record.get("signals") or {}).get("name_in_message"))
-        if kind == "comment_or_blank" and ver.comment_edit and name_in_msg:
-            return ("cosmetic_doc", "high",
-                    f"{detail}; commento/doc modificato e funzione citata nel messaggio "
-                    "(documenta il comportamento del fix)", CATEGORY_CONSISTENCY)
-        return ("cosmetic", "high", detail, CATEGORY_IRRELEVANT)
-    # verdict False (kind smentito dal codice) o None (non verificabile) → LLM
-    return None
+    if ver.verdict is not True or (ver.untouched and kind != "none"):
+        return None  # kind smentito dal codice, non verificabile o incoerente col diff → LLM
+
+    detail = f"kind={kind!r}; verificato: {ver.reason}"
+    category, _ = cosmetic_verdict(
+        comment_edit=kind == "comment_or_blank" and ver.comment_edit,
+        name_in_message=bool((record.get("signals") or {}).get("name_in_message")))
+    if category == CATEGORY_CONSISTENCY:
+        return _Rule("cosmetic_doc", "high",
+                     f"{detail}; commento/doc modificato e funzione citata nel messaggio "
+                     "(documenta il comportamento del fix)", category)
+    return _Rule("cosmetic", "high", detail, category)
 
 
 # --------------------------------------------------------------------------- #
-# API pubblica
+# Risultato (stessa forma di process_record)
 # --------------------------------------------------------------------------- #
-def deterministic_classify(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Restituisce un result dict se il record è classificabile senza LLM, altrimenti None.
-
-    Una modifica cosmetica viene accettata solo se confermata dai hunk del record;
-    tutto ciò che non è verificabile viene lasciato all'LLM.
-    """
+def _result(record: Dict[str, Any], category: str, reason: str, rules: List[str],
+            confidence: str) -> Dict[str, Any]:
     change = record.get("change") or {}
-    location = record.get("location") or {}
     signals = record.get("signals") or {}
-    path = location.get("file") or ""
-    kind = _norm_str(change.get("kind"))
-
-    rules = [
-        r for r in (
-            _rule_test_path(record, change, path),
-            _rule_cosmetic(record, change, kind, path),
-        ) if r
-    ]
-    if not rules:
-        return None
-
-    confidence = "high" if any(r[1] == "high" for r in rules) else "medium"
-    reason = "; ".join(f"{name}: {detail}" for name, _, detail, _ in rules)
-    # Il path di test domina: un commento in un file di test resta IRRELEVANT.
-    category = CATEGORY_IRRELEVANT if any(r[0] == "test_path" for r in rules) else rules[0][3]
-
-    predicted_target = 0
-    original_target = _to_int(record.get("target"), -1)
-
+    predicted = CATEGORY_TO_TARGET[category]
+    original = _to_int(record.get("target"), -1)
     return {
         "hash":            record.get("hash"),
         "commit_id":       record.get("commit_id"),
         "project":         record.get("project"),
         "func_name":       record.get("func_name"),
-        "file":            location.get("file"),
-        "original_target": original_target,
-        "predicted_target": predicted_target,
-        # target ignoto (-1) → non si può parlare di noise (coerente con process_record)
-        "is_noise":        original_target not in (-1, predicted_target),
-        # Tassonomia DiverseVul
+        "file":            (record.get("location") or {}).get("file"),
+        "original_target": original,
+        "predicted_target": predicted,
+        # target ignoto (-1) o verdetto non binario (-1) → non si può parlare di noise
+        "is_noise":        predicted != -1 and original not in (-1, predicted),
         "category":        category,
-        # Ragionamento
         "step_1_change":   "",
         "step_2_flaw":     f"[deterministico] {reason}",
         "step_3_role":     f"[deterministico] {category} — {reason}",
@@ -608,55 +549,12 @@ def deterministic_classify(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "parse_error":     False,
         "parse_error_reason": "",
         "method":          "deterministic",
-        "prompt_version":  PROMPT_VERSION,   # consistent field presence with LLM results
+        "prompt_version":  PROMPT_VERSION,   # stessi campi dei risultati LLM
         # Metadati del pre-filtro
-        "prefilter_rules":      [r[0] for r in rules],
+        "prefilter_rules":      rules,
         "prefilter_confidence": confidence,
-        # Segnali enricher (per analisi downstream)
-        "rank_in_commit":         change.get("rank_in_commit"),
-        "share_of_source_churn":  change.get("share_of_source_churn"),
-        "frac_changed":           change.get("frac_changed"),
-        "kind":                   kind,
-        "siblings_count":         len(record.get("siblings") or []),
-        "name_in_message":        signals.get("name_in_message"),
-        "cwe_matches_nvd":        signals.get("cwe_matches_nvd"),
-        "cwe_missing":            signals.get("cwe_missing_in_dataset", False),
-    }
-
-
-def undeterminable_no_diff(record: Dict[str, Any]) -> Dict[str, Any]:
-    """Risultato per un record il cui diff non è attribuibile con sicurezza alla funzione.
-
-    Nessuna chiamata API: il modello non avrebbe evidenza e produrrebbe una congettura.
-    `predicted_target=-1` (escluso dal denominatore), `parse_error=False`.
-    """
-    change = record.get("change") or {}
-    location = record.get("location") or {}
-    signals = record.get("signals") or {}
-    reason = (f"diff non attribuibile con sicurezza alla funzione "
-              f"(diff_method={change.get('diff_method')!r}, "
-              f"diff_reliable={change.get('diff_reliable')!r})")
-    return {
-        "hash":            record.get("hash"),
-        "commit_id":       record.get("commit_id"),
-        "project":         record.get("project"),
-        "func_name":       record.get("func_name"),
-        "file":            location.get("file"),
-        "original_target": _to_int(record.get("target"), -1),
-        "predicted_target": -1,
-        "is_noise":        False,
-        "category":        "UNDETERMINABLE",
-        "step_1_change":   "",
-        "step_2_flaw":     f"[deterministico] {reason}",
-        "step_3_role":     f"[deterministico] UNDETERMINABLE — {reason}",
-        "raw_output":      None,
-        "parse_error":     False,
-        "parse_error_reason": "",
-        "method":          "deterministic",
-        "prompt_version":  PROMPT_VERSION,   # consistent field presence with LLM results
-        "prefilter_rules":      ["diff_unrecoverable"],
-        "prefilter_confidence": "high",
         "diff_method":     change.get("diff_method"),
+        # Segnali enricher (per analisi downstream)
         "rank_in_commit":         change.get("rank_in_commit"),
         "share_of_source_churn":  change.get("share_of_source_churn"),
         "frac_changed":           change.get("frac_changed"),
@@ -666,3 +564,42 @@ def undeterminable_no_diff(record: Dict[str, Any]) -> Dict[str, Any]:
         "cwe_matches_nvd":        signals.get("cwe_matches_nvd"),
         "cwe_missing":            signals.get("cwe_missing_in_dataset", False),
     }
+
+
+# --------------------------------------------------------------------------- #
+# API pubblica
+# --------------------------------------------------------------------------- #
+def deterministic_classify(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Result dict se il record è classificabile senza LLM, altrimenti None.
+
+    Una modifica cosmetica è accettata solo se confermata dai hunk del record; tutto ciò che non
+    è verificabile resta all'LLM.
+    """
+    change = record.get("change") or {}
+    path = (record.get("location") or {}).get("file") or ""
+    kind = _norm_str(change.get("kind"))
+
+    rules = [r for r in (_rule_test_path(record, change, path),
+                         _rule_cosmetic(record, change, kind, path)) if r]
+    if not rules:
+        return None
+
+    # Il path di test domina: un commento in un file di test resta IRRELEVANT.
+    category = (CATEGORY_IRRELEVANT if any(r.name == "test_path" for r in rules)
+                else rules[0].category)
+    confidence = "high" if any(r.confidence == "high" for r in rules) else "medium"
+    reason = "; ".join(f"{r.name}: {r.detail}" for r in rules)
+    return _result(record, category, reason, [r.name for r in rules], confidence)
+
+
+def undeterminable_no_diff(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Risultato per un record il cui diff non è attribuibile con sicurezza alla funzione.
+
+    Nessuna chiamata API: il modello non avrebbe evidenza e produrrebbe una congettura.
+    `predicted_target=-1` (escluso dal denominatore), `parse_error=False`.
+    """
+    change = record.get("change") or {}
+    reason = (f"diff non attribuibile con sicurezza alla funzione "
+              f"(diff_method={change.get('diff_method')!r}, "
+              f"diff_reliable={change.get('diff_reliable')!r})")
+    return _result(record, "UNDETERMINABLE", reason, ["diff_unrecoverable"], "high")
