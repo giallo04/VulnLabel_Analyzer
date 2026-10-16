@@ -185,6 +185,41 @@ class TestPipelineDiffAndThinking(Base):
         self.assertEqual(self.lines(), [])
 
 
+class TestDeterministicImprovements(unittest.TestCase):
+    def test_prompt_version_in_deterministic_and_undeterminable(self):
+        from core.deterministic import deterministic_classify, undeterminable_no_diff
+        rec = make_record(1, test_file=True)
+        det = deterministic_classify(rec)
+        self.assertIsNotNone(det)
+        self.assertEqual(det["prompt_version"], prompting.PROMPT_VERSION)
+
+        bad = make_record(2)
+        bad["change"].update({"diff_reliable": False, "diff_method": "anchored"})
+        undet = undeterminable_no_diff(bad)
+        self.assertEqual(undet["prompt_version"], prompting.PROMPT_VERSION)
+
+    def test_unknown_path_with_code_edits_defers_to_llm(self):
+        from core.deterministic import deterministic_classify
+        rec = make_record(3)
+        rec["location"]["file"] = ""  # unknown path
+        rec["change"]["file_is_test"] = True  # unverified test flag
+        rec["func_name"] = "parse_header"    # not a test function name
+        # Diff has actual code edits:
+        rec["change"]["hunks"] = "@@ -1,3 +1,3 @@\n int f(int a) {\n-  return a;\n+  return a + 1;\n }"
+        det = deterministic_classify(rec)
+        self.assertIsNone(det)  # must NOT classify as test_path; sends to LLM
+
+    def test_unknown_path_with_test_func_name_still_classifies(self):
+        from core.deterministic import deterministic_classify
+        rec = make_record(4)
+        rec["location"]["file"] = ""
+        rec["change"]["file_is_test"] = True
+        rec["func_name"] = "test_parse_header"
+        det = deterministic_classify(rec)
+        self.assertIsNotNone(det)
+        self.assertEqual(det["category"], "WRONG_LABEL_IRRELEVANT")
+
+
 import shutil  # noqa: E402
 import subprocess  # noqa: E402
 

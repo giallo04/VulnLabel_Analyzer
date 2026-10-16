@@ -36,8 +36,8 @@ from .commit_verdict import CommitVerdicts
 from .deterministic import deterministic_classify, undeterminable_no_diff
 from .llm_engine import LLMAbort, LLMConfig, LLMTransientError, query_llm_ex
 from .parser import parse_llm_response
-from .prompting import (GEMINI_RESPONSE_SCHEMA, PROMPT_VERSION, aggregate_votes, build_messages,
-                        commit_key, diff_available, prompt_meta)
+from .prompting import (GEMINI_RESPONSE_SCHEMA, PROMPT_VERSION, aggregate_votes, analyze_record,
+                        build_messages, commit_key, diff_available, prompt_meta)
 
 MAX_CONSECUTIVE_TRANSIENT = 8   # stop after this many back-to-back transient failures
 MAX_PARSE_ATTEMPTS = 3          # new samples for the same prompt when the answer is not parsable
@@ -85,23 +85,44 @@ def _ask_once(msgs: Dict[str, str], cfg: LLMConfig, *, seed: int, temperature: f
 
 
 def _combine(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Majority vote over the samples (parse failures ignored). One sample = that sample."""
+    """Majority vote over the samples (parse failures ignored). One sample = that sample.
+
+    Extended cases:
+    - All samples are parse errors → UNDETERMINABLE, all_parse_errors=True, vote_tie=False.
+    - Category tie but binary target is unanimous → preserve binary prediction with
+      category=UNDETERMINABLE and category_tie=True (still in the accuracy denominator as noise
+      detection; only the sub-category is unknown).
+    - Category tie AND binary tie → full UNDETERMINABLE, vote_tie=True (excluded from denominator).
+    """
     valid = [p for p in samples if not p["parse_error"]]
     if not valid:
+        # All parse errors: not a tie — a total failure. Keep vote_tie=False for clarity.
         return {**samples[0], "n_votes": len(samples), "agreement": 0.0, "vote_counts": {},
-                "vote_tie": False}
+                "vote_tie": False, "all_parse_errors": True}
     if len(samples) == 1:
         return {**valid[0], "n_votes": 1, "agreement": 1.0,
-                "vote_counts": {valid[0]["category"]: 1}, "vote_tie": False}
+                "vote_counts": {valid[0]["category"]: 1}, "vote_tie": False,
+                "all_parse_errors": False}
     agg = aggregate_votes(valid)
     if agg["tie"]:
         rep = dict(valid[0])
+        if not agg["target_tie"]:
+            # Category split, but binary vote is unanimous (e.g. all WRONG_LABEL_* variants).
+            # Preserve the binary result: it is valid evidence; only the sub-category is unknown.
+            binary_target = agg["predicted_target"]
+            rep.update(category="UNDETERMINABLE", predicted_target=binary_target)
+            return {**rep, "n_votes": len(samples), "agreement": agg["agreement"],
+                    "vote_counts": agg["counts"], "vote_tie": False, "category_tie": True,
+                    "all_parse_errors": False}
+        # Both category and binary are tied: true UNDETERMINABLE (precision over coverage).
         rep.update(category="UNDETERMINABLE", predicted_target=-1)
         return {**rep, "n_votes": len(samples), "agreement": agg["agreement"],
-                "vote_counts": agg["counts"], "vote_tie": True}
+                "vote_counts": agg["counts"], "vote_tie": True, "category_tie": True,
+                "all_parse_errors": False}
     rep = next(p for p in valid if p["category"] == agg["category"])
     return {**rep, "n_votes": len(samples), "agreement": agg["agreement"],
-            "vote_counts": agg["counts"], "vote_tie": False}
+            "vote_counts": agg["counts"], "vote_tie": False, "category_tie": False,
+            "all_parse_errors": False}
 
 
 def process_record(record: Dict[str, Any], cfg: LLMConfig, *,
@@ -112,8 +133,11 @@ def process_record(record: Dict[str, Any], cfg: LLMConfig, *,
     The commit verdict (when `verdicts` is given) is shared by all the functions of the commit.
     """
     verdict = verdicts.get(record, ctx) if verdicts is not None else None
-    msgs = build_messages(record, verdict)          # stateless: pure function of record + verdict
-    meta = prompt_meta(record, verdict)
+    # Pre-compute the diff analysis ONCE and share between build_messages and prompt_meta,
+    # eliminating the double parse of the diff string that was happening before.
+    diff_ctx = analyze_record(record)
+    msgs = build_messages(record, verdict, ctx=diff_ctx)   # stateless: pure function of record + verdict
+    meta = prompt_meta(record, verdict, ctx=diff_ctx)
 
     votes = max(1, int(votes))
     temperature = cfg.temperature if votes == 1 else max(cfg.temperature, VOTE_MIN_TEMPERATURE)
@@ -128,6 +152,12 @@ def process_record(record: Dict[str, Any], cfg: LLMConfig, *,
     signals = record.get("signals") or {}
     location = record.get("location") or {}
 
+    # is_noise: the predicted target contradicts the original label AND is a definitive verdict
+    # (not -1). This includes the binary-unanimous/category-tied case (predicted_target=0/1 but
+    # category=UNDETERMINABLE with category_tie=True) — those ARE noise signals, just uncertain
+    # about the specific sub-category.
+    is_noise = original_target != predicted_target and predicted_target != -1
+
     return {
         "hash": record.get("hash"),
         "commit_id": record.get("commit_id"),
@@ -136,7 +166,7 @@ def process_record(record: Dict[str, Any], cfg: LLMConfig, *,
         "file": location.get("file"),
         "original_target": original_target,
         "predicted_target": predicted_target,
-        "is_noise": original_target != predicted_target and predicted_target != -1,
+        "is_noise": is_noise,
         "category": parsed["category"],
         "method": "llm",
         "model": cfg.model_name,
@@ -159,10 +189,12 @@ def process_record(record: Dict[str, Any], cfg: LLMConfig, *,
         "parse_error_reason": parsed.get("parse_error_reason", ""),
         "attempts":           parsed.get("attempts", 1),
         # self-consistency
-        "n_votes":     parsed["n_votes"],
-        "agreement":   parsed["agreement"],
-        "vote_counts": parsed["vote_counts"],
-        "vote_tie":    parsed["vote_tie"],
+        "n_votes":         parsed["n_votes"],
+        "agreement":       parsed["agreement"],
+        "vote_counts":     parsed["vote_counts"],
+        "vote_tie":        parsed["vote_tie"],
+        "category_tie":    parsed.get("category_tie", False),   # category split, binary unanimous
+        "all_parse_errors": parsed.get("all_parse_errors", False),
         # enricher signals (downstream analysis)
         "rank_in_commit":        change.get("rank_in_commit"),
         "share_of_source_churn": change.get("share_of_source_churn"),
@@ -172,6 +204,7 @@ def process_record(record: Dict[str, Any], cfg: LLMConfig, *,
         "name_in_message":       signals.get("name_in_message"),
         "cwe_matches_nvd":       signals.get("cwe_matches_nvd"),
         "cwe_missing":           signals.get("cwe_missing_in_dataset", False),
+
     }
 
 

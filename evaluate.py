@@ -136,6 +136,9 @@ def parse_pred(rec):
     pt = rec.get("predicted_target")
     if cat in ALL_CATS:
         return cat, (1 if cat == CORRECT else 0), "ok"
+    if cat == UNDET and pt in (0, 1):
+        # Category tie/split, but binary prediction is unanimous and definitive
+        return None, pt, "ok"
     if cat == UNDET or pt == -1:
         return None, None, "abstain"
     if cat is None and pt in (0, 1):  # no category, only a binary prediction

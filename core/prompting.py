@@ -291,6 +291,16 @@ def _analyze(record: Dict[str, Any]) -> Dict[str, Any]:
             "diff_status": info["status"]}
 
 
+def analyze_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Public alias for the diff-context computation.
+
+    Pre-compute once and pass as the ``ctx`` keyword argument to both
+    ``build_messages`` and ``prompt_meta`` to avoid recomputing (and re-parsing)
+    the function diff twice per function call.
+    """
+    return _analyze(record)
+
+
 # ---------------------------------------------------------------------------
 # JSON parsing shared by both passes. A pipeline failure is NOT an UNDETERMINABLE verdict.
 # ---------------------------------------------------------------------------
@@ -564,21 +574,33 @@ Think step by step as described in the method, then output only the JSON object.
 # Public API
 # ---------------------------------------------------------------------------
 def build_messages(record: Dict[str, Any],
-                   commit_verdict: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
-    """{'system': static instructions (cacheable), 'user': per-record data}."""
+                   commit_verdict: Optional[Dict[str, Any]] = None,
+                   ctx: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+    """{'system': static instructions (cacheable), 'user': per-record data}.
+
+    Pass a pre-computed ``ctx`` (from :func:`analyze_record`) to avoid re-parsing the diff
+    string when ``prompt_meta`` is also called for the same record.
+    """
     return {"system": _STATIC_PREFIX,
-            "user": _build_record_part(record, commit_verdict=commit_verdict)}
+            "user": _build_record_part(record, ctx=ctx, commit_verdict=commit_verdict)}
 
 
-def build_prompt(record: Dict[str, Any], commit_verdict: Optional[Dict[str, Any]] = None) -> str:
+def build_prompt(record: Dict[str, Any], commit_verdict: Optional[Dict[str, Any]] = None,
+                 ctx: Optional[Dict[str, Any]] = None) -> str:
     """Single-string prompt. Pure function of `record` (and the optional verdict)."""
-    return _STATIC_PREFIX + "\n\n" + _build_record_part(record, commit_verdict=commit_verdict)
+    return _STATIC_PREFIX + "\n\n" + _build_record_part(record, ctx=ctx,
+                                                        commit_verdict=commit_verdict)
 
 
 def prompt_meta(record: Dict[str, Any],
-                commit_verdict: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Traceability fields to store next to every LLM result."""
-    ctx = _analyze(record)
+                commit_verdict: Optional[Dict[str, Any]] = None,
+                ctx: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Traceability fields to store next to every LLM result.
+
+    Pass a pre-computed ``ctx`` (from :func:`analyze_record`) to avoid re-parsing the diff
+    string when ``build_messages`` is also called for the same record.
+    """
+    ctx = ctx if ctx is not None else _analyze(record)
     verdict = (commit_verdict.get("data") if commit_verdict and isinstance(commit_verdict.get("data"), dict)
                else commit_verdict) or {}
     change = record.get("change") or {}

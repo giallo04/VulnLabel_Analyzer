@@ -149,6 +149,33 @@ class TestRetriesAndVotes(Base):
                          ("UNDETERMINABLE", -1, True))
         self.assertFalse(row["parse_error"])
 
+    def test_category_tie_with_binary_agreement_preserves_target(self):
+        seq = ["WRONG_LABEL_SPREAD", "WRONG_LABEL_IRRELEVANT"]
+        lock, n = threading.Lock(), [0]
+
+        def answer(body, prompt):
+            with lock:
+                n[0] += 1
+                return llm_json(seq[(n[0] - 1) % 2])
+
+        self.mock.answer = answer
+        self.run_main("--votes", "2", "--workers", "1")
+        row = self.lines()[0]
+        self.assertEqual(row["category"], "UNDETERMINABLE")
+        self.assertEqual(row["predicted_target"], 0)
+        self.assertTrue(row["category_tie"])
+        self.assertFalse(row["vote_tie"])
+        self.assertTrue(row["is_noise"])  # original_target=1, predicted_target=0
+        self.assertFalse(row["parse_error"])
+
+    def test_all_parse_errors_marks_distinct_flag(self):
+        self.mock.answer = lambda body, prompt: "garbage"
+        self.run_main("--votes", "2", "--workers", "1")
+        row = self.lines()[0]
+        self.assertTrue(row["parse_error"])
+        self.assertTrue(row.get("all_parse_errors"))
+        self.assertFalse(row["vote_tie"])
+
 
 class TestUnrecoverableDiff(Base):
     def test_schema3_record_without_attributable_diff_is_undeterminable_without_api_call(self):

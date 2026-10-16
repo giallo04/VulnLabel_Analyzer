@@ -365,13 +365,15 @@ def query_llm_ex(prompt: str, cfg: LLMConfig, *, system: Optional[str] = None,
                     ) from exc
                 delay = _retry_delay(err, exc.headers) or DEFAULT_RATE_LIMIT_SLEEP
                 delay = min(delay + 1.0, MAX_RATE_LIMIT_SLEEP)
-                limiter.penalize(delay)   # all threads back off together
+                limiter.penalize(delay)   # all threads back off together; acquire() at loop top
                 print(
                     f"  [gemini] 429 rate limit — waiting {delay:.0f}s "
                     f"({rate_waits}/{MAX_RATE_LIMIT_WAITS})",
                     file=sys.stderr,
                 )
-                time.sleep(delay)
+                # Do NOT sleep here: limiter.penalize(delay) already pushes the next free slot
+                # forward by `delay` seconds; the next limiter.acquire() at the top of the loop
+                # will block for that duration. A redundant sleep() here would double the wait.
                 continue
 
             if code == 400 and "thinking" in message.lower():

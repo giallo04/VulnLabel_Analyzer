@@ -71,6 +71,8 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
+from .prompting import PROMPT_VERSION
+
 CATEGORY_IRRELEVANT = "WRONG_LABEL_IRRELEVANT"
 CATEGORY_CONSISTENCY = "WRONG_LABEL_CONSISTENCY"
 CATEGORY = CATEGORY_IRRELEVANT  # alias retrocompatibile
@@ -438,7 +440,10 @@ def verify_cosmetic(record: Dict[str, Any], path: str) -> Verification:
         if ext not in _C_FAMILY_EXT:
             return Verification(None, f"estensione {ext or '(nessuna)'} non C-like")
 
-    diff = (record.get("change") or {}).get("hunks")
+    change = record.get("change") or {}
+    diff = change.get("hunks")
+    if not isinstance(diff, str) or "@@" not in diff:
+        diff = change.get("function_diff")
     if not isinstance(diff, str) or "@@" not in diff:
         return Verification(None, "nessun hunk nel record")
     return _verify_from_hunks(record, diff)
@@ -509,6 +514,10 @@ def _rule_test_path(
         return ("test_path", "medium", f"file_is_test=True e funzione dal nome di test ({func_name})",
                 CATEGORY_IRRELEVANT)
     if strength == "unknown":
+        ver = verify_cosmetic(record, path)
+        if ver.verdict is False:
+            # Codice modificato e path non disponibile per verificare che sia un test: LLM
+            return None
         return ("test_path", "medium", "file_is_test=True (path non disponibile per la conferma)",
                 CATEGORY_IRRELEVANT)
     # path presente ma non riconducibile a test → il flag è sospetto
@@ -599,6 +608,7 @@ def deterministic_classify(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "parse_error":     False,
         "parse_error_reason": "",
         "method":          "deterministic",
+        "prompt_version":  PROMPT_VERSION,   # consistent field presence with LLM results
         # Metadati del pre-filtro
         "prefilter_rules":      [r[0] for r in rules],
         "prefilter_confidence": confidence,
@@ -643,6 +653,7 @@ def undeterminable_no_diff(record: Dict[str, Any]) -> Dict[str, Any]:
         "parse_error":     False,
         "parse_error_reason": "",
         "method":          "deterministic",
+        "prompt_version":  PROMPT_VERSION,   # consistent field presence with LLM results
         "prefilter_rules":      ["diff_unrecoverable"],
         "prefilter_confidence": "high",
         "diff_method":     change.get("diff_method"),
