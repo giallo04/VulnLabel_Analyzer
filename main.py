@@ -21,7 +21,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List
 
-import stats
+from stats import stats
 from core.ingestion import load_enriched_dataset
 from core.llm_engine import LLMConfig
 from core.pipeline import run_pipeline
