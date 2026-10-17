@@ -66,7 +66,7 @@ _CATEGORY_ALIASES = {
     "IRRELEVANT": CATEGORY_IRRELEVANT,
 }
 
-PROMPT_VERSION = "2026-10-audit-md-v16-compact"
+PROMPT_VERSION = "2026-10-audit-md-v16.1-compact"
 
 
 def prompt_version() -> str:
@@ -139,13 +139,13 @@ Apply in order; stop at the first match.
   - the same flaw pattern fixed separately in several functions: each function that was itself unsafe counts;
   - a partial fix;
   - a superseded invariant: the commit tightens a guard or bound because the old one was insufficient, and the changed lines are the check against the old invariant;
-  - pattern-wide hardening: the commit replaces an unsafe API or idiom (`sprintf` -> `sysfs_emit`, unchecked size multiplication -> checked helper) and the changed lines are an instance of it; a demonstrable overflow in each instance is not required.
-- **3 -> WRONG_LABEL_SPREAD.** This function was itself safe before the commit (root cause and primary fix are elsewhere), but the change adds security logic that cooperates with the fix: new check, limit, error path, handling of a newly returned error, locking, initialisation of a field the fix relies on, assert / WARN / BUG_ON, hardening. Also adopting a stricter API variant introduced by this commit (`TPARM_n` -> `TIPARM_n`, a new parameter carrying security state such as an explicit node type).
+  - pattern-wide hardening: the commit replaces an unsafe API or idiom (`sprintf` -> `sysfs_emit`, unchecked size multiplication -> checked helper) and the changed lines themselves use it; a demonstrable overflow in each instance is not required. Merely passing a new argument or constant to a callee fixed by this commit (for example an explicit node type) is not this case.
+- **3 -> WRONG_LABEL_SPREAD.** This function was itself safe before the commit (root cause and primary fix are elsewhere), but the change adds security logic that cooperates with the fix: new check, limit, error path, handling of a newly returned error, locking, initialisation of a field the fix relies on, assert / WARN / BUG_ON, hardening. Also: adopting a stricter API variant introduced by this commit (`TPARM_n` -> `TIPARM_n`), or a call site that only passes the new security-relevant argument (for example an explicit node type) to a callee fixed by this commit.
 - **4 -> WRONG_LABEL_FEATURE.** New functionality (option, protocol support, statistics, API, capability) that does not repair an unsafe behaviour of this function. If the commit message describes a bug or vulnerability fix, new helper code is Rule 3, not Rule 4.
 - **5 -> WRONG_LABEL_CONSISTENCY.** Purely mechanical adaptation with no new check, branch or logic: parameter or return type added or removed; call site updated for a changed callee or rename; type change or cast that only follows a new struct or API; rename; `static`; code moved unchanged; replacement by a behaviourally identical variant with no new security state. If the change alters what the function accepts, computes or frees so that an unsafe behaviour disappears, it is Rule 2 or 3.
 - **6 -> WRONG_LABEL_IRRELEVANT.** Unrelated to the vulnerability: refactoring, cleanup, logging, tests, samples, tools, build or performance changes, an unrelated bug fix, removal of dead code or of an obsolete subsystem.
 
-Tie-breakers: Rule 2 vs 3 = counterfactual test (unsafe in this function -> 2; safe wrapper or caller following a fix elsewhere -> 3). Rule 3 vs 5 = new security logic -> 3, only adapting -> 5. Rule 3 vs 4 = the commit repairs a flaw -> 3, adds a capability -> 4. In a library or vendored-code upgrade many functions change: judge each by its own pre-fix code; the repair is usually in few of them.
+Tie-breakers: Rule 2 vs 3 = counterfactual test (unsafe in this function -> 2; safe wrapper or caller following a fix elsewhere, including a call site that only supplies a new argument to a callee fixed by this commit -> 3). Rule 3 vs 5 = new security logic -> 3, only adapting -> 5. Rule 3 vs 4 = the commit repairs a flaw -> 3, adds a capability -> 4. In a library or vendored-code upgrade many functions change: judge each by its own pre-fix code; the repair is usually in few of them.
 
 ## Output
 
