@@ -20,6 +20,14 @@ rule-based verdicts of the commit (they do not depend on the model), and the ver
 earlier in this run for the same commit. Unparsable answers and transient failures do not
 produce a label (the neighbour stays ``pending``).
 
+Same-pattern changes ("twins")
+------------------------------
+Functions of one commit that received the same edit (``callgraph.find_twins``) are shown to each
+other in the "Same-pattern changes" section together with their label so far, so that identical
+edits get identical verdicts. Twins live in the same commit, hence in the same work unit and are
+processed sequentially: the first one decides, the others see its label. Twins already present
+in the checkpoint arrive through the same seed labels as call-graph neighbours.
+
 Resume
 ------
 The checkpoint is one JSON object per line, keyed by ``hash``. Records whose hash is already
@@ -43,14 +51,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .callgraph import SummaryCache, build_graphs, commit_key, result_fields, summarize_graphs
+from .callgraph import (SummaryCache, build_graphs, commit_key, compact_label, find_twins,
+                        result_fields, summarize_graphs)
 from .checkpoint import CheckpointWriter, load_checkpoint_deduped
 from .deterministic import (DEFAULT_DETERMINISTIC_CONFIG, DeterministicConfig,
                             deterministic_verdict)
 from .diffclean import trim_span_artifacts
 from .llm_engine import LLMAbort, LLMConfig, LLMTransientError, query_llm_ex
 from .prompting import (DEFAULT_CONFIG, PROMPT_VERSION, RESPONSE_JSON_SCHEMA, PromptBuilder,
-                        PromptConfig, analyze_record, parse_llm_output, precheck, prompt_meta)
+                        PromptConfig, analyze_record, parse_llm_output, precheck, prompt_meta,
+                        resolve_func_name)
 
 MAX_CONSECUTIVE_TRANSIENT = 8      # stop after this many back-to-back transient failures
 MAX_CONSECUTIVE_ERRORS = 5         # stop after this many back-to-back record-level exceptions
@@ -120,7 +130,7 @@ def _result(record: Dict[str, Any], verdict: Dict[str, Any], meta: Dict[str, Any
         "method": method,
         "model": model,
         "thinking_level": thinking_level,
-        # prompt version, diff status and call-graph traceability (n_labelled, ...)
+        # prompt version, diff status and call-graph / twin traceability (n_labelled, n_twins, ...)
         **meta,
         # full reasoning
         "step_1_change": data.get("step_1_change", ""),
@@ -156,11 +166,14 @@ def _result(record: Dict[str, Any], verdict: Dict[str, Any], meta: Dict[str, Any
 
 def process_record(record: Dict[str, Any], cfg: LLMConfig, *, builder: PromptBuilder,
                    graph_ctx: Optional[Dict[str, Any]] = None,
-                   ctx: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                   ctx: Optional[Dict[str, Any]] = None,
+                   twins: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """One LLM request for a single record. Returns a result row."""
     ctx = ctx if ctx is not None else analyze_record(record, builder.cfg)
-    prompt = builder.build(record, ctx, graph_ctx)
+    prompt = builder.build(record, ctx, graph_ctx, twins)
     meta = prompt_meta(record, ctx, graph_ctx, builder.cfg)
+    meta["n_twins"] = len(twins or [])
+    meta["n_twins_labelled"] = sum(1 for t in (twins or []) if (t.get("label") or {}).get("category"))
 
     reply = query_llm_ex(prompt.content, cfg, system=prompt.instructions,
                          schema=LLM_RESPONSE_SCHEMA, temperature=cfg.temperature,
@@ -380,6 +393,23 @@ def run_pipeline(
     if graphs:
         _log(f"  → call graph: {summarize_graphs(graphs)}")
 
+    # --- same-pattern changes: functions of one commit that received the same edit ---
+    twins_of: Dict[str, List[str]] = (
+        find_twins(records) if prompt_config.include_twins and use_callgraph else {})
+    by_hash = {str(r.get("hash")): r for r in records}
+    if twins_of:
+        _log(f"  → same-pattern changes: {len(twins_of)} functions have at least one twin in their commit")
+
+    def twin_entries(h: str, labels: Optional[Dict[str, Dict[str, Any]]]
+                     ) -> Optional[List[Dict[str, Any]]]:
+        """Twins of `h` with their label so far. None when labels are disabled (ablation)."""
+        if labels is None:
+            return None
+        return [{"name": resolve_func_name(by_hash[t]),
+                 "file": (by_hash[t].get("location") or {}).get("file"),
+                 "label": compact_label(labels.get(t))}
+                for t in twins_of.get(h, []) if t in by_hash]
+
     def plain_ctx(r: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Call-graph context without neighbour labels (for results that never reach the model)."""
         g = graphs.get(commit_key(r))
@@ -449,6 +479,7 @@ def run_pipeline(
         g = graphs[key]
         # bottom-up: callees before callers (CommitGraph.pos is the call-graph order)
         recs.sort(key=lambda r: g.pos.get(str(r.get("hash", "")), 0))
+        # seed: every already-known label of the commit (call-graph neighbours AND twins)
         seed = {h: known_labels[h] for h in g.pos if h in known_labels} if use_labels else {}
         units.append(_Unit(recs, g, seed))
     units.sort(key=lambda u: len(u.records), reverse=True)   # longest chains first (less tail idle time)
@@ -471,7 +502,8 @@ def run_pipeline(
                 if unit.graph is not None:
                     graph_ctx = (unit.graph.context_for(h, summaries, labels=labels)
                                  if labels is not None else unit.graph.context_for(h, summaries))
-                result = process_record(r, cfg, builder=builder, graph_ctx=graph_ctx)
+                result = process_record(r, cfg, builder=builder, graph_ctx=graph_ctx,
+                                        twins=twin_entries(h, labels))
             except LLMAbort as exc:
                 state.abort(exc, stop)
                 return

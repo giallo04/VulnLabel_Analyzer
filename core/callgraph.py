@@ -25,6 +25,14 @@ of each other and can run in parallel; inside one commit the run is serial. Trad
 mind: callers are mostly ``pending`` (they come after their callees), an early wrong label can
 propagate to its callers, and results depend on the order. ``cg_n_labelled`` is stored with every
 result so that runs with and without labels can be compared (ablation).
+
+Same-pattern changes ("twins")
+------------------------------
+Functions of one commit that receive the *same edit* (e.g. ``sprintf`` -> ``sysfs_emit`` in five
+sysfs handlers, ``vma->vm_start`` -> ``vm_start_gap(vma)`` in each architecture's mmap code) do
+not call each other, so the call graph does not link them. ``find_twins`` pairs them by the
+overlap of the identifiers their diffs add or remove; the pipeline then shows each function the
+label already issued for its twins, so identical edits get identical verdicts.
 """
 from __future__ import annotations
 
@@ -133,6 +141,83 @@ class SummaryCache:
                 return default
             s = self._cache[h] = summarize_change(rec)
         return s
+
+
+# ---------------------------------------------------------------------------
+# Same-pattern changes ("twins")
+# ---------------------------------------------------------------------------
+_IDENT_RE = re.compile(r"[A-Za-z_]\w*")
+_CAPS_ID_RE = re.compile(r"^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$")
+_TWIN_MIN_JACCARD = 0.5
+_C_NOISE = frozenset({
+    "if", "else", "while", "for", "do", "switch", "case", "default", "return", "break", "continue",
+    "goto", "sizeof", "typeof", "void", "int", "char", "short", "long", "float", "double",
+    "unsigned", "signed", "const", "static", "struct", "enum", "union", "volatile", "bool",
+    "inline", "extern", "register", "size_t", "NULL", "null", "nullptr", "true", "false",
+})
+
+
+def _norm_ident(tok: str) -> str:
+    """Identifier with the instance-specific tail removed.
+
+    ``TPARM_1`` -> ``TPARM``; ``RSVG_NODE_TYPE_FILTER_PRIMITIVE_BLEND`` -> ``RSVG_NODE_TYPE``
+    (ALL_CAPS constants keep their first three segments); other names are kept verbatim."""
+    tok = re.sub(r"_\d+$", "", tok)
+    if _CAPS_ID_RE.match(tok):
+        tok = "_".join(tok.split("_")[:3])
+    return tok
+
+
+def change_tokens(record: Dict[str, Any]) -> Optional[frozenset]:
+    """Identifiers that were removed or added by the function's diff (None if not a code change).
+
+    Tokens present on both sides (same multiset of identifiers) are dropped, so only what the
+    edit actually replaces, introduces or deletes remains: ``sprintf`` -> ``sysfs_emit`` gives
+    ``{sprintf, sysfs_emit}``; ``vma->vm_start`` -> ``vm_start_gap(vma)`` gives
+    ``{vm_start, vm_start_gap}``. C keywords and basic types are ignored."""
+    try:
+        ctx = analyze_record(record)
+    except Exception:
+        return None
+    if ctx["diff_kind"] != "code":
+        return None
+    minus: Dict[str, int] = defaultdict(int)
+    plus: Dict[str, int] = defaultdict(int)
+    for ln in ctx["diff_text"].splitlines():
+        if not ln.startswith(("+", "-")) or _HDR_RE.match(ln):
+            continue
+        content = _NONCODE_RE.sub(_blank, ln[1:]).strip()
+        if not content or content.startswith(("//", "/*", "*")):
+            continue
+        bag = minus if ln[0] == "-" else plus
+        for t in _IDENT_RE.findall(content):
+            if t not in _C_NOISE:
+                bag[_norm_ident(t)] += 1
+    changed = {t for t in set(minus) | set(plus) if minus.get(t, 0) != plus.get(t, 0)}
+    return frozenset(changed) or None
+
+
+def find_twins(records: Iterable[Dict[str, Any]]) -> Dict[str, List[str]]:
+    """hash -> hashes of the other functions of the same commit that received the same edit.
+
+    Two functions are twins when the sets of identifiers changed by their diffs overlap with
+    Jaccard similarity >= 0.5 (see ``change_tokens``). Pairwise, not transitive."""
+    by_commit: Dict[str, List[Tuple[str, frozenset]]] = defaultdict(list)
+    for r in records:
+        toks = change_tokens(r)
+        if toks:
+            by_commit[commit_key(r)].append((str(r.get("hash")), toks))
+    twins: Dict[str, List[str]] = {}
+    for items in by_commit.values():
+        for i, (h1, t1) in enumerate(items):
+            for h2, t2 in items[i + 1:]:
+                if h1 == h2:
+                    continue
+                inter = len(t1 & t2)
+                if inter and inter / len(t1 | t2) >= _TWIN_MIN_JACCARD:
+                    twins.setdefault(h1, []).append(h2)
+                    twins.setdefault(h2, []).append(h1)
+    return twins
 
 
 # ---------------------------------------------------------------------------

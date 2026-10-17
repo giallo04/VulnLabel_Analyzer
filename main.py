@@ -27,7 +27,7 @@ from core.llm_engine import LLMConfig
 from core.pipeline import run_pipeline
 
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
-API_KEY_ENVS = ("GEMINI_API_KEY", "GOOGLE_API_KEY")
+API_KEY_ENVS = ("GEMINI_API_KEY", "GOOGLE_API_KEY","API")
 
 
 # ---------------------------------------------------------------------------
