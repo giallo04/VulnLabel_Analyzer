@@ -1,121 +1,113 @@
 # VulnLabel Analyzer
 
-Find wrongly labeled functions in the **DiverseVul** vulnerability dataset, using an LLM (Gemini API).
+Detect mislabeled functions in the **DiverseVul** vulnerability dataset using an LLM (Gemini API).
 
 ## The problem
 
-DiverseVul marks **every** function touched by a CVE-fixing commit as vulnerable (`target=1`). But a fix commit often also contains refactoring, API updates, logging, or new features. Those functions get labeled "vulnerable" even though they are not. This is called *commit tangling*.
+DiverseVul labels **every** function touched by a CVE-fixing commit as vulnerable (`target=1`). But fix commits often also contain refactoring, API updates, logging or new features, so many of those functions are not vulnerable (*commit tangling*). VulnLabel Analyzer re-examines each function and estimates how accurate the original labels are.
 
-VulnLabel Analyzer checks each function and tells you whether its label is right.
-
-## How it works
+## Pipeline
 
 ```
 DiverseVul ──▶ 1. Enrich ──▶ 2. Classify ──▶ 3. Stats
-               (dv_enricher)   (main.py)       (stats.py)
+               dv_enricher    main.py         stats/
 ```
 
-1. **Enrich** – finds each function in its Git repo and extracts the before/after diff.
-2. **Classify** – Gemini assigns each function a category (see below). Obvious cosmetic changes are filtered out without an API call.
-3. **Stats** – computes label accuracy, confidence intervals, and noise per project and commit.
+1. **Enrich** – locates each function in its Git repository and extracts the function-level before/after diff, plus commit context.
+2. **Classify** – a deterministic pre-filter resolves obvious cases (tests, non-C/C++ files, purely cosmetic changes) without an API call. The rest goes to Gemini, with **one call per function**. The prompt includes:
+   - a per-commit verdict (nature, root cause, fix pattern), computed once and shared by all functions of the commit;
+   - a static call graph of the commit's functions, analyzed callees-first, so each function sees the labels already assigned to its neighbours;
+   - "twin" functions that received the same edit, to keep identical edits consistent.
+3. **Stats** – label accuracy with 95% Wilson confidence intervals, broken down by method, category and project. Optional manual validation on a stratified sample.
 
 ## Requirements
 
-- Python 3.11+ (no external packages needed)
-- Git in your PATH (for step 1 only)
-- A [Gemini API key](https://aistudio.google.com/apikey), set as an environment variable:
+- Python 3.11+ (standard library only)
+- Git in `PATH` (step 1 only)
+- A [Gemini API key](https://aistudio.google.com/apikey) in the environment:
 
 ```bash
-export GEMINI_API_KEY="your-key"
-# PowerShell: $env:GEMINI_API_KEY="your-key"
+export GEMINI_API_KEY="your-key"      # PowerShell: $env:GEMINI_API_KEY="your-key"
 ```
 
 ## Quick start
 
-**1. Enrich the dataset**
-
 ```bash
+# 1. Enrich the dataset (clones repos into --workdir)
 python -m dv_enricher --dataset diversevul_20230702.zip --out enriched.jsonl --workdir work --workers 4
+
+# 2. Classify (resumable: re-run the same command after a crash or quota stop)
+python main.py --dataset enriched.jsonl --rpm 10 --workers 4
+
+# 3. Statistics from the checkpoint
+python -m stats.stats summary --checkpoint data/output/gemini/checkpoint.jsonl
 ```
 
-**2. Classify the functions**
-
-```bash
-python main.py --dataset enriched.jsonl --model gemini-3.8-flash --workers 4 --rpm 27
-```
-
-Set `--rpm` to your account's rate limit. If the run stops (crash, Ctrl+C, daily quota), just run the same command again: it resumes where it left off.
-
-**3. Get the statistics**
-
-```bash
-python stats.py summary --checkpoint data/output/gemini/checkpoint.jsonl
-```
+Set `--rpm` to your account's rate limit. Use a new `--out-dir` when changing model or prompt, so results are not mixed.
 
 ## Categories
 
 | Category | Label | Meaning |
 | --- | --- | --- |
-| `CORRECT_LABEL` | 1 | Contains the vulnerability and its fix. |
-| `WRONG_LABEL_SPREAD` | 0 | The fix is spread across functions; this one is only a side part. |
-| `WRONG_LABEL_CONSISTENCY` | 0 | API or consistency update caused by the fix, no security meaning. |
-| `WRONG_LABEL_FEATURE` | 0 | Adds a feature instead of fixing a bug. |
-| `WRONG_LABEL_IRRELEVANT` | 0 | Refactoring, logging, tests, or formatting. |
-| `UNDETERMINABLE` | -1 | Not enough context. Excluded from the results. |
+| `CORRECT_LABEL` | 1 | The function contains the vulnerability and the diff fixes it. |
+| `WRONG_LABEL_SPREAD` | 0 | Safe before the commit; the change only supports a fix located elsewhere. |
+| `WRONG_LABEL_CONSISTENCY` | 0 | Mechanical adaptation (rename, signature, call-site update), no new logic. |
+| `WRONG_LABEL_FEATURE` | 0 | New functionality, not a bug fix. |
+| `WRONG_LABEL_IRRELEVANT` | 0 | Refactoring, logging, tests, formatting, unrelated changes. |
+| `UNDETERMINABLE` | -1 | Missing or unusable evidence. Excluded from the statistics. |
 
-## Main options for `main.py`
+A function is counted as **noise** when the predicted label differs from the original one.
 
-| Flag | Default | What it does |
+## `main.py` options
+
+| Flag | Default | Description |
 | --- | --- | --- |
-| `--dataset` | `enriched.jsonl` | Input from `dv_enricher` |
-| `--out-dir` | `data/output/gemini` | Where results are saved |
-| `--model` | `gemini-3.8-flash` | Gemini model to use |
-| `--workers` | `4` | Parallel requests |
-| `--rpm` | `10` | Max requests per minute (0 = no limit) |
-| `--votes` | `1` | Samples per function for majority voting (odd number, 3 = most accurate) |
-| `--thinking` | `high` | `minimal`, `low`, `medium`, `high`, or `default` |
-| `--limit` | `0` (all) | Only process N records (good for testing) |
-| `--no-resume` | off | Redo everything, ignore the checkpoint |
-| `--retry-errors` | off | On resume, retry records that failed to parse |
+| `--dataset` | `enriched.jsonl` | Input produced by `dv_enricher` |
+| `--out-dir` | `data/output/gemini` | Output directory |
+| `--model` | `gemini-3.5-flash-lite` | Gemini model id |
+| `--workers` | `4` | Parallel workers (one commit each) |
+| `--rpm` | `10` | Client-side requests/minute cap (`0` = unlimited) |
+| `--temperature` | `0.4` | Sampling temperature |
+| `--thinking` | `high` | `minimal`, `low`, `medium`, `high`, `default` |
+| `--limit` | `0` (all) | Process only N records (for testing) |
+| `--max-per-commit` | `0` (no cap) | Cap records per commit, limiting giant tangled commits |
+| `--skip-deterministic` | off | Send every record to the API |
+| `--no-callgraph` | off | Disable call-graph context (ablation) |
+| `--retry-errors` | off | On resume, re-query unparsable answers |
+| `--no-resume` | off | Ignore the existing checkpoint |
 
-Tip: to try a different model or prompt, use a new `--out-dir` so old results are not mixed in.
+Run `python main.py --help` for the full list.
 
 ## Output files
 
-Saved in `--out-dir`:
+In `--out-dir`:
 
-- `checkpoint.jsonl` – one result per function, written as it goes
-- `results.csv` and `results_full.jsonl` – final results (the second includes raw model output)
-- `accuracy_summary.json` and `stats_report.txt` – accuracy numbers
-- `commit_verdicts.jsonl` – one summary per commit, so all functions in a commit are judged consistently
+- `checkpoint.jsonl` – one result per function, written incrementally
+- `results.csv`, `results_full.jsonl` – final results (the latter with raw model output)
+- `accuracy_summary.json`, `stats_report.txt` – accuracy estimates
+- `commit_verdicts.jsonl` – per-commit verdicts
 
-## Checking results by hand
+## Manual validation
 
-You can verify the LLM's work and get more reliable metrics:
+Check the LLM against your own judgment on a stratified sample (N per category, at most one function per commit):
 
 ```bash
-# 1. Export CSVs to review
-python stats.py export-review --checkpoint data/output/gemini/checkpoint.jsonl
-
-# 2. Fill in the "verdetto" column: ok / ERROR / idk (leave empty to skip)
-
-# 3. Compute metrics from your answers
-python stats.py review data/output/gemini/review_llm.csv data/output/gemini/review_static.csv \
-       --checkpoint data/output/gemini/checkpoint.jsonl
+python stats/sample_for_review.py data/output/gemini/results_full.jsonl -o stats/review_sample.csv
+# Fill in the human_vulnerable column: ok = vulnerable, no = not vulnerable
+python stats/evaluate_review.py stats/review_sample.csv
 ```
 
-This gives accuracy, confusion matrix, precision/recall/F1, MCC, Cohen's kappa, and an estimate of the true accuracy of the dataset labels.
+The report (`review_report.md`, `review_metrics.json`) includes the confusion matrix, precision/recall/F1, MCC, Cohen's kappa and Wilson intervals.
 
 ## Project structure
 
 ```
-├── main.py          # Step 2: classification
-├── stats.py         # Step 3: statistics and review
-├── evaluate.py      # Evaluation script
-├── core/            # LLM client, prompts, parsing, checkpointing, pipeline
-├── dv_enricher/     # Step 1: enrichment (run with python -m dv_enricher)
-├── tests/           # Run: python -m unittest discover -s tests -v
-└── data/output/     # Results
+main.py          # step 2: classification entry point
+core/            # pipeline, prompts, LLM client, call graph, deterministic filter, checkpoint
+dv_enricher/     # step 1: dataset enrichment
+stats/           # step 3: statistics and manual-validation scripts
+tests/           # unit tests (mocked API)
+data/output/     # generated results
 ```
 
 ## Tests
@@ -124,7 +116,7 @@ This gives accuracy, confusion matrix, precision/recall/F1, MCC, Cohen's kappa, 
 python -m unittest discover -s tests -v
 ```
 
-Tests use a mocked API, so no network or API key is needed.
+No network or API key needed.
 
 ## License
 
