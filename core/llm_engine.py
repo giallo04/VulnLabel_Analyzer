@@ -68,7 +68,7 @@ class LLMConfig:
     model_name: str = "gemini-3.5-flash"
     api_key: str | None = field(default=None, repr=False)
     base_url: str = "https://generativelanguage.googleapis.com"
-    temperature: float = 0.2            # basso: stesso input -> stessa etichetta (riproducibilità)
+    temperature: float = 0.4           # basso: stesso input -> stessa etichetta (riproducibilità)
     seed: int = 55
     max_output_tokens: int = 32768      # thinking tokens included (high thinking can use a lot)
     timeout: float = 300                # seconds per request

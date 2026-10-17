@@ -1,0 +1,43 @@
+{
+  "seed": 55,
+  "n_per_category": 10,
+  "population": {
+    "WRONG_LABEL_IRRELEVANT": {
+      "n": 493,
+      "n_pred_vuln": 0,
+      "n_pred_non_vuln": 493,
+      "n_commits": 90
+    },
+    "WRONG_LABEL_CONSISTENCY": {
+      "n": 334,
+      "n_pred_vuln": 0,
+      "n_pred_non_vuln": 334,
+      "n_commits": 51
+    },
+    "CORRECT_LABEL": {
+      "n": 1095,
+      "n_pred_vuln": 1095,
+      "n_pred_non_vuln": 0,
+      "n_commits": 62
+    },
+    "WRONG_LABEL_SPREAD": {
+      "n": 290,
+      "n_pred_vuln": 0,
+      "n_pred_non_vuln": 290,
+      "n_commits": 39
+    },
+    "WRONG_LABEL_FEATURE": {
+      "n": 67,
+      "n_pred_vuln": 0,
+      "n_pred_non_vuln": 67,
+      "n_commits": 5
+    }
+  },
+  "sampled": {
+    "WRONG_LABEL_FEATURE": 5,
+    "WRONG_LABEL_CONSISTENCY": 10,
+    "WRONG_LABEL_IRRELEVANT": 10,
+    "CORRECT_LABEL": 10,
+    "WRONG_LABEL_SPREAD": 10
+  }
+}
