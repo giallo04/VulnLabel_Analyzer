@@ -75,7 +75,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     api.add_argument("--no-schema", action="store_true",
                      help="Do not send responseSchema (structured output); for models that do "
                           "not support it")
-    api.add_argument("--seed", type=int, default=42, help="Seed for reproducibility")
+    api.add_argument("--seed", type=int, default=55, help="Seed for reproducibility")
     api.add_argument("--timeout", type=int, default=300, help="Per-request timeout in seconds")
     api.add_argument("--retries", type=int, default=6,
                      help="Attempts for transient transport errors (5xx / network); exponential "
