@@ -1,162 +1,131 @@
-# VulnLabelAnalyzer
+# VulnLabel Analyzer
 
-> Framework LLM-based (solo API) per misurare l'accuratezza delle etichette del dataset **DiverseVul** — rileva le funzioni erroneamente etichettate come vulnerabili a causa del *commit tangling*.
+Find wrongly labeled functions in the **DiverseVul** vulnerability dataset, using an LLM (Gemini API).
 
-## Panoramica
+## The problem
 
-DiverseVul etichetta come *vulnerabili* (`target=1`) **tutte** le funzioni toccate da un commit che corregge un CVE. Refactoring, adeguamenti di API e logging finiscono così marcati come vulnerabili.
+DiverseVul marks **every** function touched by a CVE-fixing commit as vulnerable (`target=1`). But a fix commit often also contains refactoring, API updates, logging, or new features. Those functions get labeled "vulnerable" even though they are not. This is called *commit tangling*.
 
-Il framework lavora in tre passi:
+VulnLabel Analyzer checks each function and tells you whether its label is right.
 
-1. **Arricchimento** (`dv_enricher`): localizza ogni funzione nel repository Git, estrae il diff e calcola segnali deterministici.
-2. **Classificazione** (`main.py`): un modello via **Gemini API** assegna a ogni funzione una categoria DiverseVul. Un pre-filtro deterministico evita la chiamata API per i casi palesemente cosmetici.
-3. **Misura** (`stats.py`): l'unico modulo di statistiche — accuratezza delle label, intervalli di confidenza, rumore per progetto/commit, metriche dalla revisione manuale.
+## How it works
 
 ```
-diversevul_*.zip ─▶ dv_enricher ─▶ enriched.jsonl ─▶ main.py ─▶ checkpoint.jsonl ─▶ stats.py
-                                                    (API)         (resume)        (accuratezza)
+DiverseVul ──▶ 1. Enrich ──▶ 2. Classify ──▶ 3. Stats
+               (dv_enricher)   (main.py)       (stats.py)
 ```
 
-## Requisiti
+1. **Enrich** – finds each function in its Git repo and extracts the before/after diff.
+2. **Classify** – Gemini assigns each function a category (see below). Obvious cosmetic changes are filtered out without an API call.
+3. **Stats** – computes label accuracy, confidence intervals, and noise per project and commit.
 
-- Python 3.11+, **nessuna dipendenza esterna** (solo stdlib).
-- Git nel PATH (solo per `dv_enricher`).
-- Una chiave API Gemini (<https://aistudio.google.com/apikey>), passata **solo** via variabile d'ambiente:
+## Requirements
+
+- Python 3.11+ (no external packages needed)
+- Git in your PATH (for step 1 only)
+- A [Gemini API key](https://aistudio.google.com/apikey), set as an environment variable:
 
 ```bash
-export GEMINI_API_KEY="..."        # oppure GOOGLE_API_KEY   (PowerShell: $env:GEMINI_API_KEY="...")
+export GEMINI_API_KEY="your-key"
+# PowerShell: $env:GEMINI_API_KEY="your-key"
 ```
 
-## Workflow
+## Quick start
 
-### 1. Arricchimento
+**1. Enrich the dataset**
 
 ```bash
 python -m dv_enricher --dataset diversevul_20230702.zip --out enriched.jsonl --workdir work --workers 4
 ```
 
-Riprendibile: i record già in `enriched.jsonl` e i repository già clonati vengono riusati. Opzioni utili: `--project`, `--sample N`, `--hashes-file`, `--nvd`, `--repo-map`.
-
-**Schema v3: diff per funzione e `--refresh`.** Ogni record ha `change.function_diff`: il diff della sola funzione, ottenuto **confrontando la funzione prima e dopo il commit** (`dv_enricher/funcspan.py`): la stessa funzione viene ritrovata sul lato post-fix (per nome; a parità di nome vince la più simile e la più vicina alla posizione attesa; sono gestiti funzioni rinominate nello stesso file e file spostati/rinominati) e i due testi vengono confrontati. Il diff contiene così per costruzione solo righe di quella funzione, con numeri di riga reali. Le versioni precedenti attribuivano le righe `+` con ancore di riga: in un file riscritto/riformattato/riordinato (es. libreria aggiornata, caso cJSON) al modello arrivava il corpo di *altre* funzioni (`frac_changed` > 1, «il diff mostra cJSON_Minify»). Campi nuovi: `diff_method` (`pair`, `pair_renamed`, `pair_moved`, `removed`, `added`, `anchored`), `diff_reliable`, `whitespace_only`, `counterpart`. Se la controparte non esiste si ripiega sulle ancore di riga, **accettate solo se plausibili** (non si attribuiscono più righe cancellate di quante la funzione ne abbia); altrimenti il diff è marcato non affidabile e il modello non lo vede. La differenza di soli spazi/indentazione (anche righe spezzate o unite; gli spazi dentro le stringhe contano) è dichiarata esplicitamente e non è mai scambiata per una modifica. Per rielaborare un `enriched.jsonl` vecchio:
-
-```bash
-python -m dv_enricher --dataset diversevul_20230702.zip --out enriched.jsonl --workdir work --refresh
-```
-
-`--refresh` rielabora i record con `schema_version` < 3 e **aggiunge** le nuove righe in coda; in lettura, per ogni hash vince l'ultima riga. Senza refresh, `main.py` **salta senza chiamare l'API e senza scrivere nel checkpoint** i record vecchi il cui diff è troncato o non attendibile (lo segnala nel log). I record di schema ≥ 3 senza diff attribuibile sono invece registrati come `UNDETERMINABLE` (regola `diff_unrecoverable`, nessuna chiamata API, esclusi dal denominatore). Limiti di caratteri: `--max-hunk-chars` e `--max-function-diff-chars` (testa e coda se supera il limite). Timeout git: `DV_GIT_TIMEOUT` (default 900 s).
-
-### 2. Classificazione
+**2. Classify the functions**
 
 ```bash
 python main.py --dataset enriched.jsonl --model gemini-3.8-flash --workers 4 --rpm 27
 ```
 
-Il **thinking è `high` di default** (`--thinking minimal|low|medium|high|default`). `default` non invia `thinkingConfig`: serve per modelli senza livelli di thinking (es. Gemma); se il modello rifiuta il thinking l'errore è fatale e chiaro, non una riga rovinata per ogni record. Il thinking consuma token di output, per questo `--max-output-tokens` è salito a 32768. Per il free tier (≈500 richieste/giorno) usa un modello Flash-Lite, ad es. `--model gemini-3.5-flash-lite --rpm 15`; verifica i limiti nella pagina Rate limit di AI Studio.
+Set `--rpm` to your account's rate limit. If the run stops (crash, Ctrl+C, daily quota), just run the same command again: it resumes where it left off.
 
-**Coerenza tra le funzioni dello stesso commit.** Il commit viene caratterizzato **una sola volta** (`core/commit_verdict.py`: natura, causa radice, schema della correzione, ambito `localized|distributed|sweep`; una chiamata per commit a temperatura 0, thread-safe) e il verdetto è inserito **identico** nel prompt di ogni sua funzione (`<commit_verdict>`); il modello non ridescrive più il commit, giudica solo la funzione rispetto a esso. Il verdetto è salvato in `<out-dir>/commit_verdicts.jsonl`, quindi dopo un resume il commit resta descritto come prima. Il verdetto vede messaggio, CVE, CWE (unione su tutte le funzioni del commit), dimensione e file principali. Ogni risultato salva `commit_nature`, `commit_root_cause`, `commit_fix_pattern`, `commit_fix_scope`; `stats.py summary` riporta quanti commit hanno descrizioni discordanti (deve essere 0). Le chiamate restano stateless: il prompt è funzione pura di record + verdetto.
-
-**Accuratezza e precisione.** Temperatura default `1` (come documentato), seed fisso, regole statiche in `systemInstruction`, **output strutturato** (`responseSchema`: JSON sempre valido e `category` dentro l'enum; `--no-schema` per modelli che non lo supportano). Un output non parsabile è ritentato fino a 3 volte (se troncato da `MAX_TOKENS`, con budget raddoppiato) e, se ancora fallisce, è un `parse_error` — mai un verdetto (`--retry-errors` lo rimette in coda al resume). Con `--votes 3` si vota a maggioranza su 3 campioni (temperatura ≥ 0.7, seed diversi); un pareggio è `UNDETERMINABLE` con `vote_tie=true`, e `agreement` è un indice di confidenza. Ogni risultato salva `prompt_version`, `thinking_level`, `diff_method`, `diff_truncated`, `attempts`, `n_votes`, `agreement`. Se il checkpoint contiene risultati di un'altra versione del prompt, `main.py` lo segnala: per riclassificare usa un `--out-dir` nuovo (o `--no-resume`).
-
-- Il **checkpoint** (`<out-dir>/checkpoint.jsonl`, una riga JSON per funzione) viene scritto dopo ogni record. Se il run si interrompe (crash, Ctrl+C, quota giornaliera) rilancia lo stesso comando: i record già presenti vengono saltati. `--no-resume` rielabora tutto.
-- **Non vengono scritti nel checkpoint** (così sono ritentati): quota giornaliera esaurita, chiave non valida, API non raggiungibile/sovraccarica dopo i retry. Risposte bloccate dai filtri o non parsabili sono registrate come `UNDETERMINABLE` con `parse_error=true`.
-- Il run si ferma da solo alla prima quota giornaliera esaurita o dopo 8 errori transitori consecutivi.
-- Se il checkpoint contiene risultati di un altro modello, viene mostrato un avviso: quei record **non** vengono rielaborati. Per valutare un nuovo modello da solo usa un `--out-dir` diverso.
-- A fine run vengono scritti `results.csv`, `results_full.jsonl` (con `raw_output`), `accuracy_summary.json` e `stats_report.txt`.
-
-**Velocità e carico sull'API (v11).**
-
-- **Stima iniziale.** Prima del run il log mostra chiamate attese (min–max) e il tempo minimo imposto da `--rpm`. È il tetto rpm, non i `--workers`, a fissare la durata: con `--rpm 5 --votes 3` e 4 476 record il minimo è ~45 h, con `--vote-policy adaptive` scende a ~25 h, con `--votes 1` a ~15 h.
-- **Voto adattivo (default).** Un verdetto che *conferma* la label originale vale 1 chiamata; solo i sospetti rumore (e i verdetti non parsabili/`UNDETERMINABLE`) ricevono gli altri voti. I record con `n_votes=1` sono quelli confermati al primo campione. `--vote-policy always` ripristina il comportamento precedente.
-- **Back-off per 5xx/503.** Attese esponenziali con jitter (10 s, 20 s, 40 s … max 120 s, rispettando `Retry-After`), condivise da tutti i worker (nessun retry in parallelo contro un modello sovraccarico), e gli errori 5xx *non* consumano il budget rpm.
-- **Contesto dai commit.** Il prompt include `<commit_siblings>` (altre funzioni/frammenti flaggati dello stesso commit: file, righe modificate, tipo). Regola 0: una modifica solo preparatoria (nuove variabili, dichiarazioni, attributi) con header/include modificati nello stesso commit è `UNDETERMINABLE`, non `WRONG_LABEL_IRRELEVANT` (caso `file_tryelf` / `elfclass.h`). `PROMPT_VERSION` passa a `v11-siblings`: i risultati già nel checkpoint restano validi ma vengono segnalati come di versione diversa.
-
-### 3. Statistiche (`stats.py`)
+**3. Get the statistics**
 
 ```bash
-# accuratezza delle label stimata dal classificatore
 python stats.py summary --checkpoint data/output/gemini/checkpoint.jsonl
+```
 
-# CSV per la verifica manuale (colonna `verdetto` da compilare)
+## Categories
+
+| Category | Label | Meaning |
+| --- | --- | --- |
+| `CORRECT_LABEL` | 1 | Contains the vulnerability and its fix. |
+| `WRONG_LABEL_SPREAD` | 0 | The fix is spread across functions; this one is only a side part. |
+| `WRONG_LABEL_CONSISTENCY` | 0 | API or consistency update caused by the fix, no security meaning. |
+| `WRONG_LABEL_FEATURE` | 0 | Adds a feature instead of fixing a bug. |
+| `WRONG_LABEL_IRRELEVANT` | 0 | Refactoring, logging, tests, or formatting. |
+| `UNDETERMINABLE` | -1 | Not enough context. Excluded from the results. |
+
+## Main options for `main.py`
+
+| Flag | Default | What it does |
+| --- | --- | --- |
+| `--dataset` | `enriched.jsonl` | Input from `dv_enricher` |
+| `--out-dir` | `data/output/gemini` | Where results are saved |
+| `--model` | `gemini-3.8-flash` | Gemini model to use |
+| `--workers` | `4` | Parallel requests |
+| `--rpm` | `10` | Max requests per minute (0 = no limit) |
+| `--votes` | `1` | Samples per function for majority voting (odd number, 3 = most accurate) |
+| `--thinking` | `high` | `minimal`, `low`, `medium`, `high`, or `default` |
+| `--limit` | `0` (all) | Only process N records (good for testing) |
+| `--no-resume` | off | Redo everything, ignore the checkpoint |
+| `--retry-errors` | off | On resume, retry records that failed to parse |
+
+Tip: to try a different model or prompt, use a new `--out-dir` so old results are not mixed in.
+
+## Output files
+
+Saved in `--out-dir`:
+
+- `checkpoint.jsonl` – one result per function, written as it goes
+- `results.csv` and `results_full.jsonl` – final results (the second includes raw model output)
+- `accuracy_summary.json` and `stats_report.txt` – accuracy numbers
+- `commit_verdicts.jsonl` – one summary per commit, so all functions in a commit are judged consistently
+
+## Checking results by hand
+
+You can verify the LLM's work and get more reliable metrics:
+
+```bash
+# 1. Export CSVs to review
 python stats.py export-review --checkpoint data/output/gemini/checkpoint.jsonl
 
-# metriche dalla revisione manuale + accuratezza corretta del dataset
+# 2. Fill in the "verdetto" column: ok / ERROR / idk (leave empty to skip)
+
+# 3. Compute metrics from your answers
 python stats.py review data/output/gemini/review_llm.csv data/output/gemini/review_static.csv \
        --checkpoint data/output/gemini/checkpoint.jsonl
 ```
 
-**`summary`** — accuratezza = record non rumorosi / record validi, con intervallo di Wilson al 95%, per: totale, metodo (`llm` / `deterministic`), categoria, progetto, e rumore medio ± dev.std. per commit. *Record valido* = senza `parse_error` e con `predicted_target ∈ {0,1}`: parse error e `UNDETERMINABLE` sono esclusi dal denominatore e riportati a parte.
+This gives accuracy, confusion matrix, precision/recall/F1, MCC, Cohen's kappa, and an estimate of the true accuracy of the dataset labels.
 
-**`export-review`** — scrive `review_llm.csv` e `review_static.csv`. Compila `verdetto` con:
-
-| Verdetto | Significato |
-|---|---|
-| `ok` | il classificatore ha ragione |
-| `ERROR` | il classificatore ha torto (la verità è `1 - predicted_target`) |
-| `idk` | non so decidere (escluso dalle metriche principali) |
-| vuoto | non revisionata (esclusa) |
-
-Opzioni: `--only-disagreements`, `--include-parse-errors`, `--repo-map` (JSON `{"progetto": "owner/repo"}` per la colonna `commit_url`).
-
-**`review`** — da uno o più CSV compilati calcola: accuracy del classificatore (con IC95 e limiti con `idk` = errore / = ok), matrice di confusione, precision/recall/F1 per classe, macro-F1, balanced accuracy, MCC, Cohen's kappa, tabelle per `category`/`project` (`--group-by`). Con `--checkpoint` calcola anche l'**accuratezza corretta delle label del dataset**: la precisione dei record segnalati come rumore e il rumore mancato tra i non segnalati (se ne hai verificati a campione) vengono estrapolati all'intero dataset. Senza record non segnalati verificati la stima è un limite superiore. Scrive `review_metrics.txt` e `review_metrics.json`.
-
-## Tassonomia
-
-| Categoria | `predicted_target` | Significato |
-|---|:---:|---|
-| `CORRECT_LABEL` | **1** | La funzione contiene la vulnerabilità e il suo fix: etichetta corretta. |
-| `WRONG_LABEL_SPREAD` | **0** | Il fix è sparso su più funzioni; questa ne porta solo una parte collaterale. |
-| `WRONG_LABEL_CONSISTENCY` | **0** | Modifica di coerenza/adeguamento API richiesta dal fix, senza semantica di sicurezza. |
-| `WRONG_LABEL_FEATURE` | **0** | La modifica aggiunge funzionalità invece di riparare un comportamento difettoso. |
-| `WRONG_LABEL_IRRELEVANT` | **0** | Modifica irrilevante: refactoring, logging, test, formattazione. |
-| `UNDETERMINABLE` | **−1** | Contesto insufficiente. Escluso dal calcolo. |
-
-## Opzioni di `main.py`
-
-| Flag | Default | Descrizione |
-|---|---|---|
-| `--dataset` | `enriched.jsonl` | JSONL prodotto da `dv_enricher` |
-| `--out-dir` | `data/output/gemini` | Cartella di checkpoint, risultati e statistiche |
-| `--model` | `gemini-3.8-flash` | Modello Gemini |
-| `--workers` | `4` | Richieste parallele |
-| `--rpm` | `10` | Tetto richieste/minuto lato client (0 = nessun tetto). **Impostalo al limite del tuo account** |
-| `--temperature` / `--seed` | `1` / `42` | Campionamento / riproducibilità |
-| `--votes` | `1` | Risposte per funzione per il voto di maggioranza (dispari; 3 = massima precisione) |
-| `--vote-policy` | `adaptive` | `adaptive`: 1 campione per funzione, gli altri `votes-1` solo se la risposta contraddice la label del dataset o è inutilizzabile (~1,3× chiamate invece di 3×); `always`: tutti i voti per ogni funzione |
-| `--no-commit-verdict` | `False` | Non caratterizzare il commit una volta (solo ablazione) |
-| `--no-schema` | `False` | Non inviare `responseSchema` |
-| `--retry-errors` | `False` | Al resume, ririchiede i record con `parse_error` |
-| `--timeout` | `300` | Timeout per richiesta (s) |
-| `--retries` | `6` | Tentativi su errori transitori (5xx/rete), back-off esponenziale con jitter (10 s … 120 s) |
-| `--max-output-tokens` | `32768` | Token massimi in output (thinking incluso) |
-| `--thinking` | `high` | `minimal` / `low` / `medium` / `high` / `default` (= non inviare `thinkingConfig`) |
-| `--base-url` | API Google | Solo per proxy/test |
-| `--limit` | `0` (tutti) | Limita il numero di record |
-| `--max-per-commit` | `0` (nessun cap) | Cap di funzioni per commit (riduce il peso dei commit giganti) |
-| `--skip-deterministic` | `False` | Invia tutto all'API, senza pre-filtro |
-| `--no-resume` | `False` | Non saltare i record già nel checkpoint |
-
-Gestione dei limiti: i 429 al minuto attendono il `retryDelay` indicato dal server (tutti i thread insieme); una quota giornaliera esaurita ferma il run in modo pulito; `limit: 0` o chiave non valida sono errori fatali (exit code 1).
-
-## Struttura del progetto
+## Project structure
 
 ```
-vuln_label_analyzer/
-├── main.py              # classificazione via API (Passo 2)
-├── stats.py             # unico modulo di misura: summary / export-review / review
-├── core/
-│   ├── llm_engine.py    # client Gemini: rate limiter, gestione 429, retry
-│   ├── commit_verdict.py # verdetto di commit: una chiamata per commit, cache + disco
-│   ├── pipeline.py      # pre-filtro + chiamate API + voto + checkpoint/resume
-│   ├── deterministic.py # pre-filtro senza API
-│   ├── prompting.py     # prompt + tassonomia
-│   ├── parser.py        # parsing/validazione della risposta
-│   ├── checkpoint.py    # JSONL incrementale
-│   └── ingestion.py     # lettura enriched.jsonl
-├── dv_enricher/         # Passo 1: arricchimento (python -m dv_enricher)
-│   └── funcspan.py      # funzioni C/C++ e diff confrontando la coppia pre/post-fix
-├── tests/test_pipeline.py   # python -m unittest discover -s tests -v  (mock API, nessuna rete)
-├── tests/test_diff_scope.py # diff ristretto alla funzione, prompt, thinking, --refresh, repo git reale
-├── tests/test_function_pair.py # coppia pre/post-fix su repo git reali (riscrittura, file spostato, funzione rimossa)
-├── tests/test_consistency.py   # un verdetto per commit, retry, voto di maggioranza
-└── data/output/         # checkpoint e risultati
+├── main.py          # Step 2: classification
+├── stats.py         # Step 3: statistics and review
+├── evaluate.py      # Evaluation script
+├── core/            # LLM client, prompts, parsing, checkpointing, pipeline
+├── dv_enricher/     # Step 1: enrichment (run with python -m dv_enricher)
+├── tests/           # Run: python -m unittest discover -s tests -v
+└── data/output/     # Results
 ```
+
+## Tests
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Tests use a mocked API, so no network or API key is needed.
+
+## License
+
+GPL-3.0. See [LICENSE](LICENSE).
