@@ -84,10 +84,13 @@ def commit_url(project, sha, repo_map):
     return f"https://github.com/{base}/commit/{sha}"
 
 
-def eligible(rec, excluded):
+def eligible(rec, excluded, only=None):
     if rec.get("parse_error"):
         return False
-    if rec.get("category") in excluded or not rec.get("category"):
+    cat = rec.get("category")
+    if not cat or cat in excluded:
+        return False
+    if only and cat not in only:
         return False
     return rec.get("predicted_target") in (0, 1)
 
@@ -100,6 +103,8 @@ def main():
     ap.add_argument("--seed", type=int, default=55)
     ap.add_argument("--exclude", nargs="*", default=["UNDETERMINABLE"],
                     help="categorie da non campionare (default: UNDETERMINABLE)")
+    ap.add_argument("--only", nargs="+", default=None,
+                    help="campiona solo queste categorie (es. --only CWE-787)")
     ap.add_argument("--max-per-project", type=int, default=0,
                     help="massimo di funzioni dallo stesso progetto nel campione (0 = nessun limite)")
     ap.add_argument("--blind", action="store_true",
@@ -117,7 +122,7 @@ def main():
             if v:
                 repo_map[k.lower()] = v
 
-    records = [r for r in load_records(args.input) if eligible(r, set(args.exclude))]
+    records = [r for r in load_records(args.input)if eligible(r, set(args.exclude), set(args.only) if args.only else None)]
     if not records:
         sys.exit("Nessun record utilizzabile nel file di input.")
 

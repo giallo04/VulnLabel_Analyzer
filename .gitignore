@@ -43,7 +43,9 @@ review_llm.csv
 review_static.csv
 review_metrics.txt
 review_metrics.json
-
+*.csv
+results_full.jsonl
+review_metrics.json
 # Eccezione: fixture di test (piccole, versionate)
 !tests/**/*.jsonl
 !tests/**/*.json
