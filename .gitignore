@@ -4,7 +4,7 @@
 # di run, chiavi API o file generati.
 # =============================================================================
 
-# --- Segreti / configurazione locale (NON committare mai la chiave API) ------
+# --- Segreti / configurazione locale -----------------------------------------
 .env
 .env.*
 !.env.example
@@ -13,49 +13,44 @@
 secrets.*
 .secrets/
 
-# --- Dataset DiverseVul (pesante, scaricabile dalla fonte) -------------------
-diversevul_*.zip
-diversevul_*.json
-diversevul_*.jsonl
+# --- Repository clonati (adatta al nome reale della cartella) ----------------
+repos/
+clones/
+
+# --- Dataset e archivi -------------------------------------------------------
 *.zip
 *.tar.gz
 *.tgz
+diversevul_*.json
+diversevul_*.jsonl
 
-# --- Output del passo 1 (dv_enricher) ----------------------------------------
-enriched.jsonl
-enriched*.jsonl
+# --- Output passo 1 (dv_enricher) --------------------------------------------
 work/
 .dv_cache/
 
-# --- Output del passo 2 (main.py) e del passo 3 (stats.py) -------------------
-# Tutto data/output/ e' generato; si tiene solo la cartella vuota.
+# --- Output passo 2 (main.py) e passo 3 (stats.py) ---------------------------
 data/output/*
 !data/output/.gitkeep
 
-# Se usi un --out-dir diverso da data/output/, questi file restano esclusi:
-checkpoint.jsonl
-checkpoint*.jsonl
-results.csv
-results_full.jsonl
+**/stats/*.md
+**/stats/*.json
+**/stats/*.csv
+
+*.jsonl
+*.csv
 accuracy_summary.json
 stats_report.txt
-review_llm.csv
-review_static.csv
 review_metrics.txt
 review_metrics.json
-*.csv
-results_full.jsonl
-review_metrics.json
-review_report.md 
-stats/*.md
-stats/*.json 
-stats/*.csv
-# Eccezione: fixture di test (piccole, versionate)
+review_report.md
+
+# --- Eccezione: fixture di test (piccole, versionate) ------------------------
 !tests/**/*.jsonl
 !tests/**/*.json
+!tests/**/*.csv
 !tests/**/*.zip
 
-# --- Python -------------------------------------------------------------------
+# --- Python ------------------------------------------------------------------
 __pycache__/
 *.py[cod]
 *$py.class
@@ -71,7 +66,7 @@ venv/
 env/
 ENV/
 
-# --- Test, coverage, linting ---------------------------------------------------
+# --- Test, coverage, linting -------------------------------------------------
 .pytest_cache/
 .coverage
 .coverage.*
@@ -81,10 +76,10 @@ htmlcov/
 .ruff_cache/
 .pytype/
 
-# --- Notebook ------------------------------------------------------------------
+# --- Notebook ----------------------------------------------------------------
 .ipynb_checkpoints/
 
-# --- Log e temporanei ---------------------------------------------------------
+# --- Log e temporanei --------------------------------------------------------
 *.log
 *.tmp
 *.bak
@@ -92,14 +87,14 @@ htmlcov/
 tmp/
 temp/
 
-# --- IDE / editor --------------------------------------------------------------
+# --- IDE / editor ------------------------------------------------------------
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 
-# --- Sistema operativo ---------------------------------------------------------
+# --- Sistema operativo -------------------------------------------------------
 .DS_Store
 Thumbs.db
 desktop.ini
